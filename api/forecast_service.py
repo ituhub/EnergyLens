@@ -89,10 +89,12 @@ class ForecastService:
         try:
             prices_df = pd.read_sql_query(
                 """
-                SELECT HourUTC, SpotPriceEUR, SpotPriceDKK
+                SELECT valid_time AS HourUTC,
+                       price_eur_mwh AS SpotPriceEUR,
+                       price_dkk_mwh AS SpotPriceDKK
                 FROM spot_prices
-                WHERE PriceArea = ?
-                ORDER BY HourUTC DESC
+                WHERE zone = ?
+                ORDER BY valid_time DESC
                 LIMIT ?
                 """,
                 conn,
@@ -106,11 +108,22 @@ class ForecastService:
             return None
 
         try:
+            # Check what columns the weather table has
+            weather_cols_cursor = conn.execute("PRAGMA table_info(weather_forecasts)")
+            weather_col_names = [r[1] for r in weather_cols_cursor]
+
+            # Build query based on available columns
+            select_cols = ["valid_time AS time"]
+            for col in ["temperature_2m", "wind_speed_10m", "shortwave_radiation",
+                         "temp_c", "wind_speed_ms", "solar_radiation"]:
+                if col in weather_col_names:
+                    select_cols.append(col)
+
             weather_df = pd.read_sql_query(
-                """
-                SELECT time, temperature_2m, wind_speed_10m, shortwave_radiation
-                FROM weather_data
-                ORDER BY time DESC
+                f"""
+                SELECT {', '.join(select_cols)}
+                FROM weather_forecasts
+                ORDER BY valid_time DESC
                 LIMIT ?
                 """,
                 conn,
@@ -181,11 +194,16 @@ class ForecastService:
         featured_df = build_energy_features(raw_df)
 
         # Filter to used_features (same columns model was trained on)
+        # Pad missing features with zeros so the scaler gets the expected shape
         available = [c for c in used_features if c in featured_df.columns]
         if "Close" not in available:
             return self._error_response(zone, hours, "Close column missing from features")
 
-        featured_df = featured_df[available]
+        # Create aligned DataFrame with all used_features, filling missing with 0
+        aligned_df = pd.DataFrame(0.0, index=featured_df.index, columns=used_features)
+        for col in available:
+            aligned_df[col] = featured_df[col]
+        featured_df = aligned_df
 
         # 4. Scale and create the last sequence
         from sklearn.preprocessing import RobustScaler

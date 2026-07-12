@@ -404,6 +404,17 @@ def load_models(zone: str = "DK1", base_dir: str = "models") -> tuple[dict, dict
         "lstm_gru_ensemble":    lambda: LSTMGRUEnsemble(n_features),
     }
 
+    # Custom unpickler: models trained on Kaggle have classes in __main__,
+    # but locally they live in ml.models. This redirects the lookup.
+    class _KaggleUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == "__main__" or module == "builtins":
+                from . import models as ml_models
+                cls = getattr(ml_models, name, None)
+                if cls is not None:
+                    return cls
+            return super().find_class(module, name)
+
     model_names = list(nn_constructors.keys()) + ["xgboost", "sklearn_ensemble"]
 
     for name in model_names:
@@ -413,14 +424,14 @@ def load_models(zone: str = "DK1", base_dir: str = "models") -> tuple[dict, dict
         try:
             if name in nn_constructors and pt_file.exists():
                 model = nn_constructors[name]()
-                state = torch.load(pt_file, map_location="cpu")
+                state = torch.load(pt_file, map_location="cpu", weights_only=True)
                 model.load_state_dict(state)
                 model.eval()
                 models[name] = model
                 logger.info(f"Loaded {name}")
             elif pkl_file.exists():
                 with open(pkl_file, "rb") as f:
-                    models[name] = pickle.load(f)
+                    models[name] = _KaggleUnpickler(f).load()
                 logger.info(f"Loaded {name}")
         except Exception as e:
             logger.warning(f"Failed to load {name}: {e}")

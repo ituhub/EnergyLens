@@ -10,6 +10,7 @@ Run locally: uvicorn api.main:app --reload --port 8000
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "energylens"))
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -41,7 +42,11 @@ forecast_svc = ForecastService(db_path="data/energylens.db", model_dir="models")
 
 @app.on_event("startup")
 async def startup():
-    db.initialize()
+    try:
+        db.initialize()
+    except Exception as e:
+        import logging
+        logging.warning(f"Database init skipped (not critical for forecasts): {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
