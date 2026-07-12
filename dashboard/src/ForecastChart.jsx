@@ -13,18 +13,16 @@
  * standalone fetch from /api/forecast + /api/prices.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
-  ComposedChart,
-  Line,
-  Area,
-  XAxis,
-  YAxis,
   CartesianGrid,
-  Tooltip,
+  ComposedChart,
   Legend,
+  Line,
   ResponsiveContainer,
-  ReferenceLine,
+  Tooltip,
+  XAxis,
+  YAxis
 } from "recharts";
 
 const API_BASE = "http://localhost:8000";
@@ -188,23 +186,22 @@ export default function ForecastChart({ zone = "DK1", hours = 24, actualDays = 2
     setError(null);
 
     try {
-      // Fetch actuals and forecast in parallel
+      // Fetch actuals and forecast in parallel (catch network/CORS errors)
       const [pricesRes, forecastRes] = await Promise.all([
-        fetch(`${API_BASE}/api/prices?zone=${zone}&days=${actualDays}`),
-        fetch(`${API_BASE}/api/forecast?zone=${zone}&hours=${hours}`),
+        fetch(`${API_BASE}/api/prices?zone=${zone}&days=${actualDays}`).catch(() => ({ ok: false })),
+        fetch(`${API_BASE}/api/forecast?zone=${zone}&hours=${hours}`).catch(() => ({ ok: false })),
       ]);
 
-      if (!pricesRes.ok) throw new Error(`Prices API: ${pricesRes.status}`);
-
-      const pricesData = await pricesRes.json();
-
-      // Build actuals
-      const actuals = (pricesData.records || []).map((r) => ({
-        timestamp: r.HourUTC || r.timestamp,
-        label: formatHour(r.HourUTC || r.timestamp),
-        actual: r.SpotPriceEUR ?? r.price_eur,
-        forecast: null,
-      }));
+      let actuals = [];
+      if (pricesRes.ok) {
+        const pricesData = await pricesRes.json();
+        actuals = (pricesData.records || []).map((r) => ({
+          timestamp: r.HourUTC || r.timestamp,
+          label: formatHour(r.HourUTC || r.timestamp),
+          actual: r.SpotPriceEUR ?? r.price_eur,
+          forecast: null,
+        }));
+      }
 
       // Handle forecast (may be 503 if no models trained yet)
       let forecasts = [];
