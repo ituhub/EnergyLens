@@ -1,0 +1,1 @@
+{"source": "nordpool", "endpoint": "dataset/Elspotprices", "arrival_utc": "2026-07-10T16:35:09.226337+00:00", "data": {"total": 0, "filters": "{\"PriceArea\":[\"DK1\",\"DK2\"]}", "sort": "HourUTC asc", "limit": 500, "dataset": "Elspotprices", "records": []}}
