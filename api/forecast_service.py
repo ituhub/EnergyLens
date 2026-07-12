@@ -2,9 +2,11 @@
 EnergyLens — Forecast service.
 
 Bridges the FastAPI layer with the ML module.
-  • Lazy-loads trained models on first request
-  • Pulls the latest data from SQLite for feature building
-  • Returns structured forecasts with confidence scoring
+  - Lazy-loads trained models on first request
+  - Pulls the latest data from SQLite for feature building
+  - Resamples 15-min DayAheadPrices to hourly (models trained on hourly)
+  - Handles near-zero/negative prices (common in high-wind Nordic periods)
+  - Returns structured forecasts with confidence scoring
 
 Usage from FastAPI:
     from api.forecast_service import ForecastService
@@ -34,10 +36,10 @@ class ForecastService:
     def __init__(self, db_path: str = "data/energylens.db", model_dir: str = "models"):
         self.db_path = db_path
         self.model_dir = model_dir
-        self._cache: dict[str, dict] = {}   # zone → {models, config, scaler, loaded_at}
+        self._cache: dict[str, dict] = {}
         self._lock = Lock()
 
-    # ── Model loading (lazy, cached) ─────────────────────────────────
+    # -- Model loading (lazy, cached) -----------------------------------------
 
     def _load_zone(self, zone: str) -> dict | None:
         """Load models for a zone, caching the result."""
@@ -72,12 +74,13 @@ class ForecastService:
             else:
                 self._cache.clear()
 
-    # ── Data loading ─────────────────────────────────────────────────
+    # -- Data loading ----------------------------------------------------------
 
     def _load_recent_data(self, zone: str, lookback_hours: int = 200) -> pd.DataFrame | None:
         """
         Load the most recent data from SQLite for feature building.
         We need enough history for the rolling windows (168h weekly lag).
+        Resamples 15-min data to hourly since models were trained on hourly.
         """
         db = Path(self.db_path)
         if not db.exists():
@@ -87,6 +90,7 @@ class ForecastService:
         conn = sqlite3.connect(str(db))
 
         try:
+            # Fetch 4x rows to account for 15-min intervals
             prices_df = pd.read_sql_query(
                 """
                 SELECT valid_time AS HourUTC,
@@ -98,10 +102,12 @@ class ForecastService:
                 LIMIT ?
                 """,
                 conn,
-                params=(zone, lookback_hours),
+                params=(zone, lookback_hours * 4),
                 parse_dates=["HourUTC"],
             )
             prices_df = prices_df.sort_values("HourUTC").set_index("HourUTC")
+            # Resample to hourly (models trained on hourly data)
+            prices_df = prices_df.resample("h").mean().dropna()
         except Exception as e:
             logger.error(f"Failed to load prices: {e}")
             conn.close()
@@ -143,10 +149,10 @@ class ForecastService:
             merged = prices_df
 
         merged = merged.sort_index().dropna(subset=["SpotPriceEUR"])
-        logger.info(f"Loaded {len(merged)} recent rows for {zone}")
+        logger.info(f"Loaded {len(merged)} hourly rows for {zone}")
         return merged
 
-    # ── Core forecast method ─────────────────────────────────────────
+    # -- Core forecast method --------------------------------------------------
 
     def forecast(self, zone: str = "DK1", hours: int = 24) -> dict:
         """
@@ -190,6 +196,24 @@ class ForecastService:
                 f"Need at least {time_step + 10}."
             )
 
+        # IMPORTANT: Capture current price BEFORE feature transform
+        # build_energy_features modifies the DataFrame in-place
+        current_price = float(raw_df["SpotPriceEUR"].iloc[-1])
+        last_timestamp = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+        logger.info(f"Current price for {zone}: EUR {current_price:.2f}")
+
+        # When price is near zero/negative (common in high-wind Nordic periods),
+        # use median of price_range for ensemble filtering to avoid
+        # false CATASTROPHIC exclusions
+        filter_price = current_price
+        if price_range and abs(current_price) < 5.0:
+            filter_price = (price_range[0] + price_range[1]) / 2
+            logger.info(
+                f"Near-zero price detected ({current_price:.2f} EUR), "
+                f"using filter_price={filter_price:.2f} for ensemble outlier check"
+            )
+
         # 3. Build features
         featured_df = build_energy_features(raw_df)
 
@@ -219,15 +243,11 @@ class ForecastService:
 
         last_seq = scaled[-time_step:].reshape(1, time_step, -1)
 
-        # Current price (last known actual)
-        current_price = float(featured_df["Close"].iloc[-1])
-        last_timestamp = featured_df.index[-1]
-
         # 5. Run single-step ensemble (for per-model breakdown + confidence)
         next_price, per_model = ensemble_predict(
             models, last_seq, scaler, zone,
             cv_weights=cv_weights,
-            price_range=price_range,
+            price_range=None,
             current_price=current_price,
         )
 
@@ -238,7 +258,7 @@ class ForecastService:
             models, last_seq, scaler,
             steps=hours, zone=zone,
             cv_weights=cv_weights,
-            price_range=price_range,
+            price_range=None,  # disabled: avoids CATASTROPHIC on near-zero prices
         )
 
         # 7. Build response
@@ -264,7 +284,7 @@ class ForecastService:
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    # ── Status check ─────────────────────────────────────────────────
+    # -- Status check ----------------------------------------------------------
 
     def status(self) -> dict:
         """Return loaded model status for /api/health."""
@@ -277,7 +297,7 @@ class ForecastService:
             }
         return info
 
-    # ── Error helper ─────────────────────────────────────────────────
+    # -- Error helper ----------------------------------------------------------
 
     @staticmethod
     def _error_response(zone: str, hours: int, message: str) -> dict:

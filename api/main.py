@@ -4,10 +4,19 @@ EnergyLens — FastAPI backend API.
 Serves spot prices, forecasts, pipeline health, and quality metrics
 to the React dashboard frontend.
 
+Data freshness logic:
+  - Price endpoints first try the requested date range (e.g. last 48h)
+  - If no rows match (data is stale), falls back to the most recent
+    N rows available and marks the response as data_status="stale"
+  - If data matches the requested range, data_status="fresh"
+  - The dashboard and logs always show which mode is active
+
 Run locally: uvicorn api.main:app --reload --port 8000
 """
 
 import sys
+import sqlite3
+import logging
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "energylens"))
@@ -18,13 +27,19 @@ from typing import Optional
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from core.database import Database
 from api.forecast_service import ForecastService
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("energylens.api")
 
 app = FastAPI(
     title="EnergyLens API",
     description="Energy market forecasting platform API",
-    version="0.2.0",
+    version="0.4.0",
 )
 
 # CORS — allow React dev server
@@ -36,39 +51,171 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-db = Database()
-forecast_svc = ForecastService(db_path="data/energylens.db", model_dir="models")
+DB_PATH = "data/energylens.db"
+forecast_svc = ForecastService(db_path=DB_PATH, model_dir="models")
 
+
+# --- SQLite helpers -----------------------------------------------------------
+
+def query_db(sql: str, params: tuple = ()) -> list[dict]:
+    """Run a query against SQLite and return list of dicts."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_data_bounds() -> dict:
+    """Get the min/max valid_time and total count in spot_prices."""
+    rows = query_db(
+        "SELECT MIN(valid_time) as oldest, MAX(valid_time) as newest, COUNT(*) as total FROM spot_prices"
+    )
+    if rows and rows[0]["total"] > 0:
+        return rows[0]
+    return {"oldest": None, "newest": None, "total": 0}
+
+
+def get_zone_prices(zone: str, start_iso: str, end_iso: str) -> tuple[list[dict], str]:
+    """
+    Fetch prices for a zone within a date range.
+    If no rows match, falls back to the most recent data available.
+    Returns (records, data_status) where data_status is 'fresh' or 'stale'.
+    """
+    # First try: exact date range
+    records = query_db(
+        """
+        SELECT valid_time, zone, price_eur_mwh, price_dkk_mwh
+        FROM spot_prices
+        WHERE zone = ? AND valid_time >= ? AND valid_time <= ?
+        ORDER BY valid_time ASC
+        """,
+        (zone, start_iso, end_iso),
+    )
+
+    if records:
+        logger.info(
+            f"[FRESH] {zone}: {len(records)} rows from {records[0]['valid_time']} "
+            f"to {records[-1]['valid_time']}"
+        )
+        return records, "fresh"
+
+    # Fallback: get the most recent N rows regardless of date
+    # Calculate how many hours were requested
+    try:
+        start_dt = datetime.fromisoformat(start_iso)
+        end_dt = datetime.fromisoformat(end_iso)
+        requested_hours = max(int((end_dt - start_dt).total_seconds() / 3600), 24)
+    except Exception:
+        requested_hours = 48
+
+    records = query_db(
+        """
+        SELECT valid_time, zone, price_eur_mwh, price_dkk_mwh
+        FROM spot_prices
+        WHERE zone = ?
+        ORDER BY valid_time DESC
+        LIMIT ?
+        """,
+        (zone, requested_hours),
+    )
+    records = list(reversed(records))  # chronological order
+
+    if records:
+        bounds = get_data_bounds()
+        logger.warning(
+            f"[STALE] {zone}: No data in requested range ({start_iso[:10]} to {end_iso[:10]}). "
+            f"Falling back to latest {len(records)} rows. "
+            f"DB newest: {bounds['newest']}, DB oldest: {bounds['oldest']}. "
+            f"Run auto_refresh.py or download fresh data!"
+        )
+        return records, "stale"
+
+    logger.error(f"[EMPTY] {zone}: No data at all in spot_prices table!")
+    return [], "empty"
+
+
+def get_record_counts() -> dict:
+    """Get row counts for all data tables."""
+    counts = {}
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+        for (table,) in cursor:
+            count = conn.execute(f"SELECT COUNT(*) FROM [{table}]").fetchone()[0]
+            counts[table] = count
+    finally:
+        conn.close()
+    return counts
+
+
+# --- Startup ------------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup():
-    try:
-        db.initialize()
-    except Exception as e:
-        import logging
-        logging.warning(f"Database init skipped (not critical for forecasts): {e}")
+    db = Path(DB_PATH)
+    if not db.exists():
+        logger.error(f"Database not found at {DB_PATH}")
+        return
+
+    bounds = get_data_bounds()
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    if bounds["total"] == 0:
+        logger.warning("spot_prices table is EMPTY — dashboard will show no data")
+    else:
+        newest = bounds["newest"]
+        logger.info(f"Database: {bounds['total']} spot price rows")
+        logger.info(f"Date range: {bounds['oldest']} -> {newest}")
+
+        # Check staleness
+        try:
+            newest_dt = datetime.fromisoformat(newest.replace("T", " ").split("+")[0])
+            age_hours = (datetime.utcnow() - newest_dt).total_seconds() / 3600
+            if age_hours > 48:
+                logger.warning(
+                    f"DATA IS STALE — newest record is {age_hours:.0f}h old ({newest}). "
+                    f"Charts will use fallback mode. Run: python auto_refresh.py"
+                )
+            else:
+                logger.info(f"Data is FRESH — newest record is {age_hours:.1f}h old")
+        except Exception:
+            pass
+
+    counts = get_record_counts()
+    logger.info(f"All tables: {counts}")
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # HEALTH
-# ═══════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 @app.get("/api/health")
 async def health():
     """Pipeline health overview."""
-    counts = db.get_record_counts()
+    counts = get_record_counts()
+    bounds = get_data_bounds()
     ml_status = forecast_svc.status()
     return {
         "status": "ok",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "database": counts,
+        "data_range": {
+            "oldest": bounds["oldest"],
+            "newest": bounds["newest"],
+            "total_spot_prices": bounds["total"],
+        },
         "ml_models": ml_status,
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# SPOT PRICES (Phase 1)
-# ═══════════════════════════════════════════════════════════════════════
+# ==============================================================================
+# SPOT PRICES — with stale-data fallback
+# ==============================================================================
 
 @app.get("/api/prices")
 async def get_prices(
@@ -79,63 +226,70 @@ async def get_prices(
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
 
-    records = db.get_prices_as_of(
-        zone=zone,
-        valid_start=start.isoformat(),
-        valid_end=end.isoformat(),
-    )
+    records, data_status = get_zone_prices(zone, start.isoformat(), end.isoformat())
 
     return {
         "zone": zone,
         "count": len(records),
-        "start": start.isoformat(),
-        "end": end.isoformat(),
+        "data_status": data_status,
+        "start": records[0]["valid_time"] if records else start.isoformat(),
+        "end": records[-1]["valid_time"] if records else end.isoformat(),
         "records": records,
     }
 
 
 @app.get("/api/prices/latest")
 async def get_latest_prices():
-    """Get the most recent prices for all active zones."""
-    zones = ["DK1", "DK2"]
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(hours=48)
-
+    """Get the most recent 24 prices for all active zones."""
     result = {}
-    for zone in zones:
-        records = db.get_prices_as_of(
-            zone=zone,
-            valid_start=start.isoformat(),
-            valid_end=end.isoformat(),
+    for zone in ["DK1", "DK2"]:
+        records = query_db(
+            """
+            SELECT valid_time, zone, price_eur_mwh, price_dkk_mwh
+            FROM spot_prices
+            WHERE zone = ?
+            ORDER BY valid_time DESC
+            LIMIT 24
+            """,
+            (zone,),
         )
-        result[zone] = records[-24:] if len(records) > 24 else records
+        records = list(reversed(records))
+        if records:
+            logger.info(f"/prices/latest {zone}: {len(records)} rows, newest={records[-1]['valid_time']}")
+        result[zone] = records
 
     return result
 
 
 @app.get("/api/prices/compare")
 async def compare_zones(
-    days: int = Query(2, ge=1, le=30),
+    days: int = Query(2, ge=1, le=365),
 ):
     """Compare DK1 vs DK2 prices for the chart overlay."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
 
     result = {}
+    data_status = "fresh"
+
     for zone in ["DK1", "DK2"]:
-        records = db.get_prices_as_of(
-            zone=zone,
-            valid_start=start.isoformat(),
-            valid_end=end.isoformat(),
-        )
+        records, zone_status = get_zone_prices(zone, start.isoformat(), end.isoformat())
         result[zone] = records
+        if zone_status != "fresh":
+            data_status = zone_status
+
+    result["_meta"] = {
+        "data_status": data_status,
+        "requested_days": days,
+        "note": "STALE: showing most recent available data" if data_status == "stale" else "Showing live data",
+    }
 
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════
+# ==============================================================================
 # FORECASTS (Phase 3)
-# ═══════════════════════════════════════════════════════════════════════
+# ==============================================================================
 
 @app.get("/api/forecast")
 async def get_forecast(
@@ -144,17 +298,11 @@ async def get_forecast(
 ):
     """
     Generate a price forecast for the next N hours.
-
-    Returns hourly predicted prices with confidence scoring and
-    per-model breakdown from the 8-model neural ensemble.
     """
     result = forecast_svc.forecast(zone=zone, hours=hours)
 
     if result.get("error"):
-        raise HTTPException(
-            status_code=503,
-            detail=result["error"],
-        )
+        raise HTTPException(status_code=503, detail=result["error"])
 
     return result
 
@@ -169,10 +317,7 @@ async def get_forecast_models():
             "message": "No models loaded yet. They load on first forecast request.",
             "zones": {},
         }
-    return {
-        "loaded": True,
-        "zones": status,
-    }
+    return {"loaded": True, "zones": status}
 
 
 @app.post("/api/forecast/reload")

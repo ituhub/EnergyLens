@@ -21,18 +21,23 @@ for d in [DATA_DIR, RAW_ARCHIVE_DIR, PROCESSED_DIR, MODEL_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # ─── Database ───
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "localhost"),
-    "port": int(os.getenv("DB_PORT", 5432)),
-    "dbname": os.getenv("DB_NAME", "energylens"),
-    "user": os.getenv("DB_USER", "energylens"),
-    "password": os.getenv("DB_PASSWORD", "energylens_dev"),
-}
+DB_HOST = os.getenv("DB_HOST", "")
 
-DATABASE_URL = (
-    f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
-    f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
-)
+if DB_HOST:
+    DB_CONFIG = {
+        "host": DB_HOST,
+        "port": int(os.getenv("DB_PORT", 5432)),
+        "dbname": os.getenv("DB_NAME", "energylens"),
+        "user": os.getenv("DB_USER", "energylens"),
+        "password": os.getenv("DB_PASSWORD", "energylens_dev"),
+    }
+    DATABASE_URL = (
+        f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
+        f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
+    )
+else:
+    DB_CONFIG = {}
+    DATABASE_URL = f"sqlite:///{DATA_DIR / 'energylens.db'}"
 
 # ─── API Keys ───
 ENTSOE_API_KEY = os.getenv("ENTSOE_API_KEY", "")

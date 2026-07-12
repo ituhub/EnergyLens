@@ -110,7 +110,8 @@ def ensemble_predict(
                 pred_eur = pred_scaled
 
             # ── SAFETY RAIL 1: Catastrophic exclusion ────────────────
-            if current_price is not None and current_price != 0:
+            # Skip when price is near zero/negative (common in Nordic wind oversupply)
+            if current_price is not None and abs(current_price) > 5.0:
                 deviation = abs(pred_eur - current_price) / (abs(current_price) + 1e-8)
                 if deviation > 0.50:
                     logger.warning(

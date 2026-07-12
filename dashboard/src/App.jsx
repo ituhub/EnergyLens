@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Area, AreaChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import ForecastChart from './ForecastChart';
 
-// ─── Design System ───
+// --- Design System ---
 const COLORS = {
   bg: "#0a0e17",
   surface: "#111827",
@@ -24,48 +24,65 @@ const COLORS = {
 
 const API_BASE = "http://localhost:8000/api";
 
-// ─── Simulated data for preview (replaced by real API in production) ───
-function generateMockPrices(zone, hours = 72) {
-  const now = new Date();
-  const base = zone === "DK1" ? 45 : 42;
-  return Array.from({ length: hours }, (_, i) => {
-    const t = new Date(now.getTime() - (hours - i) * 3600000);
-    const hour = t.getHours();
-    const dayFactor = hour >= 7 && hour <= 20 ? 1.4 : 0.7;
-    const noise = (Math.random() - 0.5) * 20;
-    const wind = Math.random() * 100;
-    return {
-      time: t.toISOString(),
-      label: `${t.getDate()}/${t.getMonth()+1} ${String(t.getHours()).padStart(2,"0")}:00`,
-      price: Math.max(-10, base * dayFactor + noise + (zone === "DK1" ? 3 : 0)),
-      wind_pct: wind,
-      zone,
-    };
-  });
-}
-
-function generateMockHealth() {
-  return {
-    spot_prices: Math.floor(Math.random() * 5000) + 8000,
-    weather_forecasts: Math.floor(Math.random() * 3000) + 12000,
-    generation: Math.floor(Math.random() * 2000) + 4000,
-    quality_quarantine: Math.floor(Math.random() * 30),
-    predictions: 0,
-  };
-}
-
-// ─── Components ───
+// --- Components ---
 
 function StatusDot({ status }) {
-  const color = status === "LIVE" ? COLORS.positive : status === "STALE" ? COLORS.warning : COLORS.negative;
+  const color = status === "LIVE" ? COLORS.positive
+    : status === "STALE" ? COLORS.warning
+    : COLORS.negative;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
       <span style={{
         width: 8, height: 8, borderRadius: "50%", backgroundColor: color,
         boxShadow: `0 0 8px ${color}`,
+        animation: status === "LIVE" ? "pulse 2s infinite" : "none",
       }} />
       <span style={{ fontSize: 11, fontWeight: 600, color, letterSpacing: "0.05em" }}>{status}</span>
     </span>
+  );
+}
+
+function StaleBanner({ newest, onRefresh }) {
+  if (!newest) return null;
+
+  const newestDate = new Date(newest);
+  const now = new Date();
+  const ageHours = Math.round((now - newestDate) / (1000 * 60 * 60));
+  const ageDays = Math.round(ageHours / 24);
+  const ageText = ageDays > 1 ? `${ageDays} days old` : `${ageHours}h old`;
+
+  return (
+    <div style={{
+      background: "rgba(251, 191, 36, 0.08)",
+      border: `1px solid rgba(251, 191, 36, 0.25)`,
+      borderRadius: 8,
+      padding: "10px 16px",
+      marginBottom: 14,
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: 16 }}>&#9888;</span>
+        <div>
+          <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.warning }}>
+            Showing historical data
+          </span>
+          <span style={{ fontSize: 12, color: COLORS.textMuted, marginLeft: 8 }}>
+            Latest record: {newestDate.toLocaleDateString("da-DK")} ({ageText})
+          </span>
+        </div>
+      </div>
+      {onRefresh && (
+        <button onClick={onRefresh} style={{
+          padding: "4px 12px", borderRadius: 6, border: `1px solid ${COLORS.warning}`,
+          background: "transparent", color: COLORS.warning, fontSize: 11,
+          fontWeight: 600, cursor: "pointer",
+        }}>
+          Refresh
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -178,7 +195,7 @@ function CustomTooltip({ active, payload, label }) {
           <span style={{ width: 8, height: 8, borderRadius: "50%", background: p.color }} />
           <span style={{ fontSize: 12, color: COLORS.textMuted }}>{p.name}:</span>
           <span style={{ fontSize: 13, fontWeight: 700, color: COLORS.text }}>
-            {typeof p.value === "number" ? `€${p.value.toFixed(2)}` : p.value}
+            {typeof p.value === "number" ? `\u20AC${p.value.toFixed(2)}` : p.value}
           </span>
         </div>
       ))}
@@ -186,7 +203,7 @@ function CustomTooltip({ active, payload, label }) {
   );
 }
 
-// ─── Main Dashboard ───
+// --- Main Dashboard ---
 
 export default function EnergyLensDashboard() {
   const [activeZone, setActiveZone] = useState("Both");
@@ -195,39 +212,55 @@ export default function EnergyLensDashboard() {
   const [dk2Data, setDk2Data] = useState([]);
   const [health, setHealth] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [useApi, setUseApi] = useState(true);
+  const [apiConnected, setApiConnected] = useState(false);
+  const [dataStatus, setDataStatus] = useState("unknown"); // "fresh" | "stale" | "empty" | "offline"
+  const [newestRecord, setNewestRecord] = useState(null);
 
   const loadData = useCallback(async () => {
-    if (useApi) {
-      try {
-        const [priceRes, healthRes] = await Promise.all([
-          fetch(`${API_BASE}/prices/compare?days=${timeRange === "24h" ? 1 : timeRange === "48h" ? 2 : timeRange === "7d" ? 7 : 30}`),
-          fetch(`${API_BASE}/health`),
-        ]);
-        const prices = await priceRes.json();
-        const h = await healthRes.json();
-        setDk1Data((prices.DK1 || []).map(r => ({
-          time: r.valid_time, label: new Date(r.valid_time).toLocaleString("da-DK", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }),
-          price: r.price_eur_mwh, zone: "DK1",
-        })));
-        setDk2Data((prices.DK2 || []).map(r => ({
-          time: r.valid_time, label: new Date(r.valid_time).toLocaleString("da-DK", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }),
-          price: r.price_eur_mwh, zone: "DK2",
-        })));
-        setHealth(h.database);
-      } catch {
-        setUseApi(false);
+    try {
+      const days = timeRange === "24h" ? 1 : timeRange === "48h" ? 2 : timeRange === "7d" ? 7 : 30;
+
+      const [priceRes, healthRes] = await Promise.all([
+        fetch(`${API_BASE}/prices/compare?days=${days}`),
+        fetch(`${API_BASE}/health`),
+      ]);
+
+      const prices = await priceRes.json();
+      const h = await healthRes.json();
+
+      // Extract data status from API response
+      const meta = prices._meta || {};
+      const status = meta.data_status || "fresh";
+      setDataStatus(status);
+      setApiConnected(true);
+
+      // Get newest record timestamp from health endpoint
+      if (h.data_range?.newest) {
+        setNewestRecord(h.data_range.newest);
       }
+
+      // Map price records (works for both fresh and stale fallback)
+      const mapRecords = (records, zone) => (records || []).map(r => ({
+        time: r.valid_time,
+        label: new Date(r.valid_time).toLocaleString("da-DK", {
+          day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"
+        }),
+        price: r.price_eur_mwh,
+        zone,
+      }));
+
+      setDk1Data(mapRecords(prices.DK1, "DK1"));
+      setDk2Data(mapRecords(prices.DK2, "DK2"));
+      setHealth(h.database);
+
+    } catch (err) {
+      console.error("API unreachable:", err);
+      setApiConnected(false);
+      setDataStatus("offline");
     }
-    
-    if (!useApi) {
-      const hours = timeRange === "24h" ? 24 : timeRange === "48h" ? 48 : timeRange === "7d" ? 168 : 720;
-      setDk1Data(generateMockPrices("DK1", hours));
-      setDk2Data(generateMockPrices("DK2", hours));
-      setHealth(generateMockHealth());
-    }
+
     setLoading(false);
-  }, [timeRange, useApi]);
+  }, [timeRange]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
@@ -236,6 +269,12 @@ export default function EnergyLensDashboard() {
     const interval = setInterval(loadData, 30000);
     return () => clearInterval(interval);
   }, [loadData]);
+
+  // Derive the display status for the header
+  const displayStatus = !apiConnected ? "OFFLINE"
+    : dataStatus === "fresh" ? "LIVE"
+    : dataStatus === "stale" ? "STALE"
+    : "OFFLINE";
 
   // Merge data for comparison chart
   const mergedData = dk1Data.map((d, i) => ({
@@ -268,7 +307,7 @@ export default function EnergyLensDashboard() {
 
   return (
     <div style={{ background: COLORS.bg, minHeight: "100vh", color: COLORS.text, fontFamily: "'Inter', -apple-system, sans-serif" }}>
-      {/* ─── Top Bar ─── */}
+      {/* --- Top Bar --- */}
       <header style={{
         display: "flex", justifyContent: "space-between", alignItems: "center",
         padding: "14px 28px", borderBottom: `1px solid ${COLORS.border}`,
@@ -288,7 +327,7 @@ export default function EnergyLensDashboard() {
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
-          <StatusDot status={useApi ? "LIVE" : "DEMO"} />
+          <StatusDot status={displayStatus} />
           <span style={{ fontSize: 11, color: COLORS.textDim }}>
             {new Date().toLocaleString("da-DK", { hour: "2-digit", minute: "2-digit", second: "2-digit" })} CET
           </span>
@@ -297,40 +336,60 @@ export default function EnergyLensDashboard() {
 
       <main style={{ maxWidth: 1280, margin: "0 auto", padding: "20px 28px 60px" }}>
 
-        {/* ─── Metric Cards ─── */}
+        {/* --- Stale Data Banner --- */}
+        {dataStatus === "stale" && (
+          <StaleBanner newest={newestRecord} onRefresh={loadData} />
+        )}
+
+        {/* --- Offline Banner --- */}
+        {!apiConnected && (
+          <div style={{
+            background: "rgba(248, 113, 113, 0.08)",
+            border: "1px solid rgba(248, 113, 113, 0.25)",
+            borderRadius: 8, padding: "10px 16px", marginBottom: 14,
+            display: "flex", alignItems: "center", gap: 10,
+          }}>
+            <span style={{ fontSize: 16 }}>&#10060;</span>
+            <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.negative }}>
+              API offline — start the server: uvicorn api.main:app --reload --port 8000
+            </span>
+          </div>
+        )}
+
+        {/* --- Metric Cards --- */}
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 8 }}>
           <MetricCard
             label="DK1 Current"
-            value={currentDK1 ? `€${currentDK1.toFixed(2)}` : "—"}
-            sub="EUR/MWh — West Denmark"
+            value={currentDK1 ? `\u20AC${currentDK1.toFixed(2)}` : "\u2014"}
+            sub={`EUR/MWh \u2014 West Denmark${dataStatus === "stale" ? " (historical)" : ""}`}
             color={COLORS.dk1}
-            icon="⚡"
+            icon={"\u26A1"}
           />
           <MetricCard
             label="DK2 Current"
-            value={currentDK2 ? `€${currentDK2.toFixed(2)}` : "—"}
-            sub="EUR/MWh — East Denmark"
+            value={currentDK2 ? `\u20AC${currentDK2.toFixed(2)}` : "\u2014"}
+            sub={`EUR/MWh \u2014 East Denmark${dataStatus === "stale" ? " (historical)" : ""}`}
             color={COLORS.dk2}
-            icon="⚡"
+            icon={"\u26A1"}
           />
           <MetricCard
             label="Zone Spread"
-            value={`€${spread.toFixed(2)}`}
-            sub="DK1–DK2 differential"
+            value={`\u20AC${spread.toFixed(2)}`}
+            sub="DK1\u2013DK2 differential"
             color={spread > 10 ? COLORS.warning : COLORS.textMuted}
-            icon="↔"
+            icon={"\u2194"}
           />
           <MetricCard
             label="24h Average"
-            value={`€${avgDK1.toFixed(2)}`}
+            value={`\u20AC${avgDK1.toFixed(2)}`}
             sub={`${dk1Prices.length} data points`}
-            icon="μ"
+            icon={"\u03BC"}
           />
         </div>
 
-        {/* ─── Price Chart ─── */}
+        {/* --- Price Chart --- */}
         <SectionHeader
-          title="Spot Prices"
+          title={`Spot Prices${dataStatus === "stale" ? " (Historical)" : ""}`}
           right={
             <div style={{ display: "flex", gap: 10 }}>
               <ZoneToggle active={activeZone} onChange={setActiveZone} />
@@ -348,7 +407,7 @@ export default function EnergyLensDashboard() {
               <LineChart data={mergedData} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
                 <XAxis dataKey="label" tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={{ stroke: COLORS.border }} interval={Math.max(1, Math.floor(mergedData.length / 12))} />
-                <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `€${v}`} />
+                <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `\u20AC${v}`} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ fontSize: 12, color: COLORS.textMuted }} />
                 <Line type="monotone" dataKey="DK1" stroke={COLORS.dk1} strokeWidth={2} dot={false} name="DK1 West" />
@@ -364,7 +423,7 @@ export default function EnergyLensDashboard() {
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
                 <XAxis dataKey="label" tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={{ stroke: COLORS.border }} interval={Math.max(1, Math.floor(dk1Data.length / 12))} />
-                <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `€${v}`} />
+                <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `\u20AC${v}`} />
                 <Tooltip content={<CustomTooltip />} />
                 <Area type="monotone" dataKey="price" stroke={activeZone === "DK1" ? COLORS.dk1 : COLORS.dk2} strokeWidth={2} fill="url(#priceGrad)" name={`${activeZone} Price`} />
               </AreaChart>
@@ -372,8 +431,8 @@ export default function EnergyLensDashboard() {
           </ResponsiveContainer>
         </div>
 
-        {/* ─── ML Forecast ─── */}
-        <SectionHeader title="Price Forecast" right={<StatusDot status={useApi ? "LIVE" : "DEMO"} />} />
+        {/* --- ML Forecast --- */}
+        <SectionHeader title="Price Forecast" right={<StatusDot status={displayStatus} />} />
         <div style={{
           background: COLORS.surface, border: `1px solid ${COLORS.border}`,
           borderRadius: 12, padding: "20px 16px 12px",
@@ -381,7 +440,7 @@ export default function EnergyLensDashboard() {
           <ForecastChart zone={activeZone === "Both" ? "DK1" : activeZone} hours={24} actualDays={2} />
         </div>
 
-        {/* ─── Pipeline Health + Quality Gate ─── */}
+        {/* --- Pipeline Health + Quality Gate --- */}
         <div style={{ display: "flex", gap: 14, marginTop: 8 }}>
           {/* Connectors */}
           <div style={{ flex: 1 }}>
@@ -390,14 +449,29 @@ export default function EnergyLensDashboard() {
               background: COLORS.surface, border: `1px solid ${COLORS.border}`,
               borderRadius: 12, overflow: "hidden",
             }}>
-              <ConnectorRow name="Nord Pool — Spot Prices" status="LIVE" records={health?.spot_prices || 0} lastUpdate="Updated 30s ago" />
-              <ConnectorRow name="Open-Meteo — Weather Forecasts" status="LIVE" records={health?.weather_forecasts || 0} lastUpdate="Updated 12m ago" />
-              <ConnectorRow name="ENTSO-E — Generation Data" status="LIVE" records={health?.generation || 0} lastUpdate="Updated 1h ago" />
+              <ConnectorRow
+                name="Nord Pool — Spot Prices"
+                status={dataStatus === "fresh" ? "LIVE" : dataStatus === "stale" ? "STALE" : "OFFLINE"}
+                records={health?.spot_prices || 0}
+                lastUpdate={dataStatus === "fresh" ? "Updated 30s ago" : newestRecord ? `Last data: ${new Date(newestRecord).toLocaleDateString("da-DK")}` : "No data"}
+              />
+              <ConnectorRow
+                name="Open-Meteo — Weather Forecasts"
+                status={health?.weather_forecasts > 0 ? "LIVE" : "STALE"}
+                records={health?.weather_forecasts || 0}
+                lastUpdate="Weather features"
+              />
+              <ConnectorRow
+                name="ENTSO-E — Generation Data"
+                status={health?.generation > 0 ? "LIVE" : "STALE"}
+                records={health?.generation || 0}
+                lastUpdate="Generation mix"
+              />
               <div style={{ padding: "14px 16px", borderTop: `1px solid ${COLORS.border}` }}>
                 <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
                   <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.text }}>Quality Gate</span>
                   <span style={{ fontSize: 11, color: COLORS.textMuted }}>
-                    {qualityStats.passed.toLocaleString()} passed · {qualityStats.warnings} warnings · {qualityStats.failed} quarantined
+                    {qualityStats.passed.toLocaleString()} passed &middot; {qualityStats.warnings} warnings &middot; {qualityStats.failed} quarantined
                   </span>
                 </div>
                 <QualityGateBar {...qualityStats} />
@@ -435,10 +509,10 @@ export default function EnergyLensDashboard() {
           </div>
         </div>
 
-        {/* ─── Footer ─── */}
+        {/* --- Footer --- */}
         <div style={{ marginTop: 40, padding: "16px 0", borderTop: `1px solid ${COLORS.border}`, display: "flex", justifyContent: "space-between" }}>
-          <span style={{ fontSize: 11, color: COLORS.textDim }}>EnergyLens v0.1.0 — ITU Consultant</span>
-          <span style={{ fontSize: 11, color: COLORS.textDim }}>Data: Nord Pool · ENTSO-E · Open-Meteo</span>
+          <span style={{ fontSize: 11, color: COLORS.textDim }}>EnergyLens v0.4.0 &mdash; ITU Consultant</span>
+          <span style={{ fontSize: 11, color: COLORS.textDim }}>Data: Nord Pool &middot; ENTSO-E &middot; Open-Meteo</span>
         </div>
       </main>
     </div>
