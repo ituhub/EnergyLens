@@ -17,6 +17,7 @@ Run locally: uvicorn api.main:app --reload --port 8000
 import sys
 import sqlite3
 import logging
+import subprocess
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "energylens"))
@@ -26,6 +27,8 @@ from typing import Optional
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from api.forecast_service import ForecastService
 
@@ -42,10 +45,15 @@ app = FastAPI(
     version="0.4.0",
 )
 
-# CORS — allow React dev server
+# CORS — allow React dev server and deployed frontend
+import os
+allowed_origins = os.getenv(
+    "ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:5173"
+).split(",") + ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173", "*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -327,3 +335,40 @@ async def reload_models(
     """Force-reload models from disk (e.g. after retraining)."""
     forecast_svc.reload_models(zone)
     return {"status": "reloaded", "zone": zone or "all"}
+
+
+# ==============================================================================
+# DATA REFRESH (called by Cloud Scheduler)
+# ==============================================================================
+
+@app.post("/api/refresh")
+async def trigger_refresh():
+    """Trigger data refresh — called by Cloud Scheduler every 2h."""
+    result = subprocess.run(
+        ["python", "auto_refresh.py"],
+        capture_output=True, text=True, timeout=120
+    )
+    return {
+        "status": "ok" if result.returncode == 0 else "error",
+        "stdout": result.stdout[-500:] if result.stdout else "",
+        "stderr": result.stderr[-500:] if result.stderr else "",
+    }
+
+
+# ==============================================================================
+# STATIC FILES — Serve React build (MUST be last — catch-all route)
+# ==============================================================================
+
+STATIC_DIR = Path("/app/static")
+
+if STATIC_DIR.exists():
+    # Serve JS/CSS/images from /assets/
+    app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
+
+    @app.get("/{path:path}")
+    async def serve_react(path: str):
+        """Serve React app — catch-all for non-API routes."""
+        file_path = STATIC_DIR / path
+        if file_path.is_file():
+            return FileResponse(file_path)
+        return FileResponse(STATIC_DIR / "index.html")
