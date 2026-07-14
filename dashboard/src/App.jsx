@@ -465,7 +465,7 @@ export default function EnergyLensDashboard() {
                 name="ENTSO-E — Generation Data"
                 status={health?.generation > 0 ? "LIVE" : "STALE"}
                 records={health?.generation || 0}
-                lastUpdate="Generation mix"
+                lastUpdate={health?.generation > 0 ? "Generation mix" : "Set ENTSOE_API_KEY in .env"}
               />
               <div style={{ padding: "14px 16px", borderTop: `1px solid ${COLORS.border}` }}>
                 <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>

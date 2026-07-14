@@ -26,6 +26,7 @@ import pandas as pd
 from ml.training import load_models
 from ml.features import build_energy_features
 from ml.ensemble import ensemble_predict, multi_step_forecast, calculate_confidence
+from api.quality_gate import evaluate_quality_gate
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +200,15 @@ class ForecastService:
         # IMPORTANT: Capture current price BEFORE feature transform
         # build_energy_features modifies the DataFrame in-place
         current_price = float(raw_df["SpotPriceEUR"].iloc[-1])
-        last_timestamp = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+        # Use actual last data timestamp (not wall-clock) for forecast stepping
+        last_data_ts = raw_df.index[-1]
+        if hasattr(last_data_ts, 'to_pydatetime'):
+            last_timestamp = last_data_ts.to_pydatetime()
+        else:
+            last_timestamp = pd.Timestamp(last_data_ts).to_pydatetime()
+        if last_timestamp.tzinfo is None:
+            last_timestamp = last_timestamp.replace(tzinfo=timezone.utc)
 
         logger.info(f"Current price for {zone}: EUR {current_price:.2f}")
 
@@ -259,9 +268,21 @@ class ForecastService:
             steps=hours, zone=zone,
             cv_weights=cv_weights,
             price_range=None,  # disabled: avoids CATASTROPHIC on near-zero prices
+            feature_names=used_features,
+            last_timestamp=last_timestamp,
         )
 
-        # 7. Build response
+        # 7. Quality Gate evaluation
+        quality_gate = evaluate_quality_gate(
+            confidence=confidence,
+            per_model_preds=per_model,
+            forecast_prices=forecast_prices,
+            current_price=current_price,
+            last_data_timestamp=last_timestamp,
+            zone=zone,
+        )
+
+        # 8. Build response
         forecasts = []
         for i, price in enumerate(forecast_prices):
             ts = pd.Timestamp(last_timestamp) + pd.Timedelta(hours=i + 1)
@@ -281,6 +302,7 @@ class ForecastService:
             "models_total": len(models),
             "per_model": {k: round(v, 2) for k, v in per_model.items()},
             "price_range": list(price_range) if price_range else None,
+            "quality_gate": quality_gate,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
 

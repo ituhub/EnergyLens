@@ -24,8 +24,9 @@ import {
   XAxis,
   YAxis
 } from "recharts";
+import SignalQualityGate from './SignalQualityGate';
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = import.meta.env.VITE_API_URL || '';
 
 // ── Palette ─────────────────────────────────────────────────────────
 const COLORS = {
@@ -216,6 +217,7 @@ export default function ForecastChart({ zone = "DK1", hours = 24, actualDays = 2
           perModel: fData.per_model,
           currentPrice: fData.current_price,
           priceRange: fData.price_range,
+          qualityGate: fData.quality_gate,
           generatedAt: fData.generated_at,
         };
 
@@ -418,6 +420,14 @@ export default function ForecastChart({ zone = "DK1", hours = 24, actualDays = 2
           modelsTotal={forecastMeta.modelsTotal}
         />
       )}
+
+      {/* Signal Quality Gate */}
+        {forecastMeta?.qualityGate && (
+          <SignalQualityGate
+            qualityGate={forecastMeta.qualityGate}
+            confidence={forecastMeta.confidence}
+          />
+        )}
     </div>
   );
 }

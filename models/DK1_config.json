@@ -1,0 +1,29 @@
+{
+  "zone": "DK1",
+  "time_step": 48,
+  "n_features": 97,
+  "seq_len": 48,
+  "cv_results": {
+    "xgboost": {
+      "mean_mse": 0.1060244356872329,
+      "std_mse": 0.0662250869176805,
+      "n_folds": 5
+    },
+    "sklearn_ensemble": {
+      "mean_mse": 2.2385127652279344,
+      "std_mse": 2.516482645039303,
+      "n_folds": 5
+    }
+  },
+  "ensemble_weights": {
+    "xgboost": 0.9547780923495651,
+    "sklearn_ensemble": 0.04522190765043485
+  },
+  "price_range": [
+    -151.08999975,
+    526.61000475
+  ],
+  "trained_at": "2026-07-13T10:25:22.321831+00:00",
+  "data_rows": 2329,
+  "feature_count": 97
+}

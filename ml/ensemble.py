@@ -22,10 +22,40 @@ Energy-specific notes:
 import logging
 import numpy as np
 import torch
+from datetime import datetime, timedelta
 
 from .features import get_energy_price_range, get_max_step_change
 
 logger = logging.getLogger(__name__)
+
+# ── Temporal feature names that can be computed for future timesteps ──────
+TEMPORAL_FEATURES = {
+    "hour", "hour_sin", "hour_cos",
+    "dow", "dow_sin", "dow_cos",
+    "month", "month_sin", "month_cos",
+    "quarter", "is_weekend", "is_peak_hour",
+}
+
+
+def _compute_temporal_values(dt: datetime) -> dict[str, float]:
+    """Compute raw (unscaled) temporal feature values for a given datetime."""
+    hour = dt.hour
+    dow = dt.weekday()
+    month = dt.month
+    return {
+        "hour": float(hour),
+        "hour_sin": float(np.sin(2 * np.pi * hour / 24)),
+        "hour_cos": float(np.cos(2 * np.pi * hour / 24)),
+        "dow": float(dow),
+        "dow_sin": float(np.sin(2 * np.pi * dow / 7)),
+        "dow_cos": float(np.cos(2 * np.pi * dow / 7)),
+        "month": float(month),
+        "month_sin": float(np.sin(2 * np.pi * month / 12)),
+        "month_cos": float(np.cos(2 * np.pi * month / 12)),
+        "quarter": float((month - 1) // 3 + 1),
+        "is_weekend": float(1 if dow >= 5 else 0),
+        "is_peak_hour": float(1 if 7 <= hour <= 19 else 0),
+    }
 
 # ── Default ensemble weights (balanced, no single model dominates) ────────
 DEFAULT_WEIGHTS = {
@@ -137,11 +167,14 @@ def ensemble_predict(
         logger.error("No valid predictions from any model")
         return None, {}
 
-    # ── SAFETY RAIL 2: Outlier filtering (median ± 15%) ──────────────
+    # ── SAFETY RAIL 2: Outlier filtering (median ± 35%) ──────────────
+    # NOTE: Energy prices are far more volatile than equities — a 15%
+    # threshold was excluding 5/7 models on most steps.  35% keeps the
+    # guard-rail but lets the full ensemble contribute.
     if len(raw_predictions) >= 3:
         values = list(raw_predictions.values())
         median = np.median(values)
-        max_dev = 0.15
+        max_dev = 0.35
 
         filtered = {
             name: pred for name, pred in raw_predictions.items()
@@ -195,6 +228,8 @@ def multi_step_forecast(
     zone: str = "DK1",
     cv_weights: dict | None = None,
     price_range: tuple[float, float] | None = None,
+    feature_names: list[str] | None = None,
+    last_timestamp=None,
 ) -> list[float]:
     """
     Generate a multi-step (e.g. 24-hour) forecast with per-step clamping.
@@ -202,7 +237,13 @@ def multi_step_forecast(
     Each step:
       1. Run ensemble_predict on the current sequence
       2. Clamp the prediction to max_step_change from base price
-      3. Roll the sequence window forward
+      3. Roll the sequence window forward with proper feature fill
+
+    Args:
+        feature_names: ordered list of feature column names (from config['used_features']).
+                       Enables temporal feature advancement for future timesteps.
+        last_timestamp: datetime of the last known data point.
+                        If None, temporal features are forward-filled instead of computed.
     """
     if not models_dict or initial_sequence is None:
         return []
@@ -226,38 +267,99 @@ def multi_step_forecast(
 
     logger.info(f"Forecasting {steps} steps for zone {zone} (base €{base_price:.2f})")
 
+    # ── Frozen-model detection ──────────────────────────────────────
+    # Track per-model predictions across steps.  If a model returns
+    # the exact same value (within €0.50) for FROZEN_THRESHOLD
+    # consecutive steps, exclude it — it has saturated.
+    FROZEN_THRESHOLD = 3
+    model_history: dict[str, list[float]] = {name: [] for name in models_dict}
+    frozen_models: set[str] = set()
+
     for step in range(steps):
         try:
-            pred, _ = ensemble_predict(
-                models_dict, curr_seq, scaler, zone,
+            # Use a filtered model dict that excludes frozen models
+            active_models = {k: v for k, v in models_dict.items() if k not in frozen_models}
+            if not active_models:
+                logger.warning("All models frozen — falling back to full set")
+                active_models = models_dict
+
+            pred, step_preds = ensemble_predict(
+                active_models, curr_seq, scaler, zone,
                 cv_weights=cv_weights, price_range=price_range,
                 current_price=base_price,
             )
+
+            # Update frozen-model tracking
+            for name, val in step_preds.items():
+                model_history.setdefault(name, []).append(val)
+                recent = model_history[name][-FROZEN_THRESHOLD:]
+                if len(recent) >= FROZEN_THRESHOLD:
+                    if max(recent) - min(recent) < 0.50:
+                        if name not in frozen_models:
+                            frozen_models.add(name)
+                            logger.warning(
+                                f"FROZEN: {name} returned €{val:.2f} for "
+                                f"{FROZEN_THRESHOLD} consecutive steps — excluding"
+                            )
 
             if pred is None:
                 logger.warning(f"Step {step + 1}: no prediction — stopping")
                 break
 
             # ── PER-STEP CLAMP ───────────────────────────────────────
-            if base_price is not None and abs(base_price) > 1e-8:
-                # Allow cumulative change to grow per step (+15% slack)
-                max_cumulative = max_change * (1 + step * 0.15)
-                change_pct = abs(pred - base_price) / (abs(base_price) + 1e-8)
+            # Near-zero prices (common in Nordic wind oversupply) break
+            # percentage-based clamping — a €0.01 base can never reach €80.
+            # Fix: use absolute EUR cap when base_price is small.
+            MIN_ABS_STEP = 50.0  # EUR — Nordic prices swing €50+/hour during wind events
+            NEAR_ZERO_THRESHOLD = 10.0  # EUR — below this, use absolute mode
 
-                if change_pct > max_cumulative:
-                    direction = 1 if pred > base_price else -1
-                    clamped = base_price * (1 + direction * max_cumulative * 0.5)
-                    logger.warning(
-                        f"Step {step + 1} clamped: €{pred:.2f} → €{clamped:.2f} "
-                        f"({change_pct:.0%} > {max_cumulative:.0%})"
-                    )
-                    pred = clamped
+            if base_price is not None:
+                max_cumulative = max_change * (1 + step * 0.15)
+
+                if abs(base_price) <= NEAR_ZERO_THRESHOLD:
+                    # ── ABSOLUTE MODE: near-zero/negative base price ──
+                    abs_limit = MIN_ABS_STEP * (1 + step * 0.40)
+                    change_abs = abs(pred - base_price)
+
+                    if change_abs > abs_limit:
+                        direction = 1 if pred > base_price else -1
+                        clamped = base_price + direction * abs_limit
+                        logger.info(
+                            f"Step {step + 1} abs-clamped: €{pred:.2f} → €{clamped:.2f} "
+                            f"(Δ€{change_abs:.1f} > limit €{abs_limit:.1f})"
+                        )
+                        pred = clamped
+                elif abs(base_price) > 1e-8:
+                    # ── PERCENTAGE MODE: normal prices ────────────────
+                    change_pct = abs(pred - base_price) / (abs(base_price) + 1e-8)
+
+                    if change_pct > max_cumulative:
+                        direction = 1 if pred > base_price else -1
+                        # Also enforce absolute floor so small prices aren't trapped
+                        pct_limit = abs(base_price) * max_cumulative * 0.5
+                        effective_limit = max(pct_limit, MIN_ABS_STEP)
+                        clamped = base_price + direction * effective_limit
+                        logger.warning(
+                            f"Step {step + 1} clamped: €{pred:.2f} → €{clamped:.2f} "
+                            f"({change_pct:.0%} > {max_cumulative:.0%})"
+                        )
+                        pred = clamped
 
             forecasts.append(pred)
 
-            # Roll the sequence: drop first timestep, append new prediction
+            # Roll the sequence: drop first timestep, append new prediction.
+            #
+            # Three-tier feature fill strategy:
+            #   a) Price (feature 0): set to the new prediction (scaled).
+            #   b) Temporal features (hour_sin, dow_cos, …): compute for the
+            #      future hour so models see time advancing, not frozen.
+            #   c) Everything else (weather, lags, rolling stats): forward-fill
+            #      from the last known timestep — better than zeros.
             try:
-                new_row = np.zeros((1, 1, curr_seq.shape[2]))
+                # Start from last known timestep (carries weather, lags, etc.)
+                new_row = curr_seq[:, -1:, :].copy()
+
+                # (a) Overwrite price (feature 0) with the new prediction
                 if scaler is not None:
                     dummy = np.zeros((1, scaler.scale_.shape[0]))
                     dummy[0, 0] = pred
@@ -265,6 +367,22 @@ def multi_step_forecast(
                     new_row[0, 0, 0] = scaled
                 else:
                     new_row[0, 0, 0] = pred
+
+                # (b) Advance temporal features if we have the metadata
+                if feature_names and last_timestamp:
+                    future_dt = last_timestamp + timedelta(hours=step + 1)
+                    raw_temporal = _compute_temporal_values(future_dt)
+
+                    for feat_name, raw_val in raw_temporal.items():
+                        if feat_name in feature_names:
+                            idx = feature_names.index(feat_name)
+                            # Scale the raw value through the scaler
+                            if scaler is not None:
+                                dummy = np.zeros((1, scaler.scale_.shape[0]))
+                                dummy[0, idx] = raw_val
+                                new_row[0, 0, idx] = scaler.transform(dummy)[0, idx]
+                            else:
+                                new_row[0, 0, idx] = raw_val
 
                 curr_seq = np.concatenate([curr_seq[:, 1:, :], new_row], axis=1)
             except Exception:
@@ -297,9 +415,11 @@ def calculate_confidence(per_model_preds: dict, zone: str = "DK1") -> float:
     std_pred = np.std(values)
 
     # Coefficient of variation → consistency score
+    # Energy models naturally disagree more than equity models;
+    # cv * 200 (was 500) avoids punishing normal spread.
     if abs(mean_pred) > 1e-8:
         cv = std_pred / abs(mean_pred)
-        consistency = max(0, 100 - cv * 500)
+        consistency = max(0, 100 - cv * 200)
     else:
         consistency = 50.0
 
