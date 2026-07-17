@@ -172,6 +172,296 @@ function ModelBreakdown({ perModel, modelsUsed, modelsTotal }) {
   );
 }
 
+// ── Ensemble Prediction Display ───────────────────────────────────────────
+
+function EnsemblePrediction({ meta }) {
+  if (!meta) return null;
+ 
+  const {
+    currentPrice,
+    confidence,
+    modelsUsed,
+    modelsTotal,
+    priceRange,
+    perModel,
+    generatedAt,
+  } = meta;
+ 
+  // Compute ensemble predicted price from per-model data
+  // perModel can be { name: number } or { name: { prediction: number } }
+  const predictions = perModel
+    ? Object.values(perModel)
+        .map((m) => (typeof m === "number" ? m : m.prediction ?? m.predicted_price))
+        .filter((v) => v != null && isFinite(v))
+    : [];
+ 
+  const ensemblePrice =
+    predictions.length > 0
+      ? predictions.reduce((a, b) => a + b, 0) / predictions.length
+      : null;
+ 
+  if (ensemblePrice == null) return null;
+ 
+  const diff = ensemblePrice - (currentPrice || 0);
+  // Suppress % when base price is near zero — produces meaningless values
+  const pctChange =
+    currentPrice && Math.abs(currentPrice) >= 1
+      ? ((diff / Math.abs(currentPrice)) * 100).toFixed(1)
+      : null;
+ 
+  const isBullish = diff >= 0;
+  const arrow = isBullish ? "▲" : "▼";
+  const dirLabel = isBullish ? "BULLISH" : "BEARISH";
+  const accentColor = isBullish ? "#10b981" : "#ef4444";
+  const accentBg = isBullish
+    ? "rgba(16,185,129,0.08)"
+    : "rgba(239,68,68,0.08)";
+  const accentBorder = isBullish
+    ? "rgba(16,185,129,0.25)"
+    : "rgba(239,68,68,0.25)";
+ 
+  // Confidence colour
+  const confColor =
+    confidence >= 70 ? "#10b981" : confidence >= 50 ? "#f59e0b" : "#ef4444";
+ 
+  // Consensus: how many models agree on direction
+  const agreeing = perModel
+    ? Object.values(perModel).filter((m) => {
+        const pred = typeof m === "number" ? m : (m.prediction ?? m.predicted_price);
+        return pred != null && (pred >= currentPrice) === isBullish;
+      }).length
+    : modelsUsed || 0;
+  const consensusPct =
+    modelsUsed > 0 ? Math.round((agreeing / modelsUsed) * 100) : 0;
+ 
+  const fmt = (v) =>
+    v != null ? `€${v.toFixed(2)}` : "—";
+ 
+  const ts = generatedAt
+    ? new Date(generatedAt).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : null;
+ 
+  return (
+    <div
+      style={{
+        background: "linear-gradient(135deg, #0f172a 0%, #1e293b 100%)",
+        border: `1px solid ${accentBorder}`,
+        borderRadius: 14,
+        padding: "20px 22px",
+        marginBottom: 18,
+        fontFamily:
+          "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      }}
+    >
+      {/* ── Header row ── */}
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          marginBottom: 16,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span
+            style={{
+              fontSize: 10,
+              fontWeight: 700,
+              letterSpacing: "0.08em",
+              color: "#94a3b8",
+              textTransform: "uppercase",
+            }}
+          >
+            Ensemble Prediction
+          </span>
+          <span
+            style={{
+              fontSize: 10,
+              fontWeight: 700,
+              color: accentColor,
+              background: accentBg,
+              border: `1px solid ${accentBorder}`,
+              padding: "2px 8px",
+              borderRadius: 6,
+            }}
+          >
+            {arrow} {dirLabel}
+          </span>
+        </div>
+        {ts && (
+          <span style={{ fontSize: 10, color: "#64748b" }}>
+            Updated {ts}
+          </span>
+        )}
+      </div>
+ 
+      {/* ── Price hero ── */}
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          gap: 12,
+          marginBottom: 18,
+        }}
+      >
+        <span
+          style={{
+            fontSize: 32,
+            fontWeight: 800,
+            color: "#f1f5f9",
+            letterSpacing: "-0.02em",
+            lineHeight: 1,
+          }}
+        >
+          {fmt(ensemblePrice)}
+        </span>
+        {pctChange && (
+          <span
+            style={{
+              fontSize: 14,
+              fontWeight: 600,
+              color: accentColor,
+            }}
+          >
+            {isBullish ? "+" : ""}
+            {pctChange}%
+          </span>
+        )}
+        <span style={{ fontSize: 12, color: "#64748b" }}>
+          from {fmt(currentPrice)}
+        </span>
+      </div>
+ 
+      {/* ── Stats row ── */}
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(4, 1fr)",
+          gap: 12,
+        }}
+      >
+        {/* Confidence */}
+        <div
+          style={{
+            background: "rgba(15,23,42,0.6)",
+            border: "1px solid rgba(148,163,184,0.08)",
+            borderRadius: 10,
+            padding: "10px 12px",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 9,
+              fontWeight: 600,
+              color: "#64748b",
+              textTransform: "uppercase",
+              letterSpacing: "0.06em",
+              marginBottom: 4,
+            }}
+          >
+            Confidence
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: confColor }}>
+            {confidence?.toFixed(1) ?? "—"}%
+          </div>
+        </div>
+ 
+        {/* Consensus */}
+        <div
+          style={{
+            background: "rgba(15,23,42,0.6)",
+            border: "1px solid rgba(148,163,184,0.08)",
+            borderRadius: 10,
+            padding: "10px 12px",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 9,
+              fontWeight: 600,
+              color: "#64748b",
+              textTransform: "uppercase",
+              letterSpacing: "0.06em",
+              marginBottom: 4,
+            }}
+          >
+            Consensus
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: "#e2e8f0" }}>
+            {consensusPct}%
+            <span style={{ fontSize: 10, color: "#94a3b8", marginLeft: 4 }}>
+              ({agreeing}/{modelsUsed || 0})
+            </span>
+          </div>
+        </div>
+ 
+        {/* Price Range */}
+        <div
+          style={{
+            background: "rgba(15,23,42,0.6)",
+            border: "1px solid rgba(148,163,184,0.08)",
+            borderRadius: 10,
+            padding: "10px 12px",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 9,
+              fontWeight: 600,
+              color: "#64748b",
+              textTransform: "uppercase",
+              letterSpacing: "0.06em",
+              marginBottom: 4,
+            }}
+          >
+            Range
+          </div>
+          <div style={{ fontSize: 14, fontWeight: 600, color: "#e2e8f0" }}>
+            {priceRange?.min != null && priceRange?.max != null
+              ? `${fmt(priceRange.min)} – ${fmt(priceRange.max)}`
+              : predictions.length > 0
+                ? `${fmt(Math.min(...predictions))} – ${fmt(Math.max(...predictions))}`
+                : "—"}
+          </div>
+        </div>
+ 
+        {/* Models */}
+        <div
+          style={{
+            background: "rgba(15,23,42,0.6)",
+            border: "1px solid rgba(148,163,184,0.08)",
+            borderRadius: 10,
+            padding: "10px 12px",
+          }}
+        >
+          <div
+            style={{
+              fontSize: 9,
+              fontWeight: 600,
+              color: "#64748b",
+              textTransform: "uppercase",
+              letterSpacing: "0.06em",
+              marginBottom: 4,
+            }}
+          >
+            Models
+          </div>
+          <div style={{ fontSize: 18, fontWeight: 700, color: "#e2e8f0" }}>
+            {modelsUsed ?? "—"}
+            <span style={{ fontSize: 10, color: "#94a3b8", marginLeft: 2 }}>
+              / {modelsTotal ?? 8}
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+ 
+
 // ═════════════════════════════════════════════════════════════════════
 // MAIN COMPONENT
 // ═════════════════════════════════════════════════════════════════════
@@ -352,16 +642,20 @@ export default function ForecastChart({ zone = "DK1", hours = 24, actualDays = 2
           style={{
             padding: "12px 16px",
             marginBottom: 16,
-            background: "#fffbeb",
-            border: "1px solid #fde68a",
+            background: "rgba(30,136,229,0.08)",
+            border: "1px solid rgba(30,136,229,0.25)",
             borderRadius: 8,
             fontSize: 13,
-            color: "#92400e",
+            color: "#93c5fd",
           }}
         >
-          {forecastMeta.message}. Run <code>python -m ml.run_training</code> to train models,
-          then restart the API.
+          {zone} forecast models are currently in development. DK1 West Denmark forecasts are available above.
         </div>
+      )}
+
+      {/* Ensemble prediction display */}
+      {forecastMeta && (
+        <EnsemblePrediction meta={forecastMeta} />
       )}
 
       {/* Chart */}

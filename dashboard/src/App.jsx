@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { Area, AreaChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import ForecastChart from './ForecastChart';
+import AccuracyTracker from './AccuracyTracker';
+import BacktestDashboard from './BacktestDashboard';
+import ShapExplainer from './ShapExplainer';
 
 // --- Design System ---
 const COLORS = {
@@ -207,6 +210,7 @@ function CustomTooltip({ active, payload, label }) {
 
 export default function EnergyLensDashboard() {
   const [activeZone, setActiveZone] = useState("Both");
+  const [activeTab, setActiveTab] = useState("forecast");
   const [timeRange, setTimeRange] = useState("48h");
   const [dk1Data, setDk1Data] = useState([]);
   const [dk2Data, setDk2Data] = useState([]);
@@ -356,158 +360,229 @@ export default function EnergyLensDashboard() {
           </div>
         )}
 
-        {/* --- Metric Cards --- */}
-        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 8 }}>
-          <MetricCard
-            label="DK1 Current"
-            value={currentDK1 ? `\u20AC${currentDK1.toFixed(2)}` : "\u2014"}
-            sub={`EUR/MWh \u2014 West Denmark${dataStatus === "stale" ? " (historical)" : ""}`}
-            color={COLORS.dk1}
-            icon={"\u26A1"}
-          />
-          <MetricCard
-            label="DK2 Current"
-            value={currentDK2 ? `\u20AC${currentDK2.toFixed(2)}` : "\u2014"}
-            sub={`EUR/MWh \u2014 East Denmark${dataStatus === "stale" ? " (historical)" : ""}`}
-            color={COLORS.dk2}
-            icon={"\u26A1"}
-          />
-          <MetricCard
-            label="Zone Spread"
-            value={`\u20AC${spread.toFixed(2)}`}
-            sub="DK1\u2013DK2 differential"
-            color={spread > 10 ? COLORS.warning : COLORS.textMuted}
-            icon={"\u2194"}
-          />
-          <MetricCard
-            label="24h Average"
-            value={`\u20AC${avgDK1.toFixed(2)}`}
-            sub={`${dk1Prices.length} data points`}
-            icon={"\u03BC"}
-          />
+        {/* --- Tab Navigation --- */}
+        <div style={{
+          display: 'flex',
+          gap: 4,
+          marginBottom: 20,
+          background: COLORS.surfaceLight,
+          borderRadius: 8,
+          padding: 3,
+        }}>
+          {[
+            { id: 'forecast', label: '\u26A1 Forecast' },
+            { id: 'accuracy', label: '\uD83C\uDFAF Accuracy' },
+            { id: 'backtest', label: '\uD83D\uDCCA Backtest' },
+            { id: 'explain', label: '\uD83D\uDD0D Explainability' },
+          ].map(tab => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
+              style={{
+                padding: '8px 16px',
+                fontSize: 13,
+                borderRadius: 6,
+                border: 'none',
+                background: activeTab === tab.id ? COLORS.accent + '22' : 'transparent',
+                color: activeTab === tab.id ? COLORS.accent : COLORS.textDim,
+                cursor: 'pointer',
+                fontWeight: activeTab === tab.id ? 700 : 500,
+                flex: 1,
+                transition: 'all 0.2s',
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
 
-        {/* --- Price Chart --- */}
-        <SectionHeader
-          title={`Spot Prices${dataStatus === "stale" ? " (Historical)" : ""}`}
-          right={
-            <div style={{ display: "flex", gap: 10 }}>
-              <ZoneToggle active={activeZone} onChange={setActiveZone} />
-              <TimeRangeSelector active={timeRange} onChange={setTimeRange} />
+        {/* ══════ FORECAST TAB ══════ */}
+        {activeTab === 'forecast' && (
+          <>
+            {/* --- Metric Cards --- */}
+            <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 8 }}>
+              <MetricCard
+                label="DK1 Current"
+                value={currentDK1 ? `\u20AC${currentDK1.toFixed(2)}` : "\u2014"}
+                sub={`EUR/MWh \u2014 West Denmark${dataStatus === "stale" ? " (historical)" : ""}`}
+                color={COLORS.dk1}
+                icon={"\u26A1"}
+              />
+              <MetricCard
+                label="DK2 Current"
+                value={currentDK2 ? `\u20AC${currentDK2.toFixed(2)}` : "\u2014"}
+                sub={`EUR/MWh \u2014 East Denmark${dataStatus === "stale" ? " (historical)" : ""}`}
+                color={COLORS.dk2}
+                icon={"\u26A1"}
+              />
+              <MetricCard
+                label="Zone Spread"
+                value={`\u20AC${spread.toFixed(2)}`}
+                sub="DK1\u2013DK2 differential"
+                color={spread > 10 ? COLORS.warning : COLORS.textMuted}
+                icon={"\u2194"}
+              />
+              <MetricCard
+                label="24h Average"
+                value={`\u20AC${avgDK1.toFixed(2)}`}
+                sub={`${dk1Prices.length} data points`}
+                icon={"\u03BC"}
+              />
             </div>
-          }
-        />
 
-        <div style={{
-          background: COLORS.surface, border: `1px solid ${COLORS.border}`,
-          borderRadius: 12, padding: "20px 16px 12px",
-        }}>
-          <ResponsiveContainer width="100%" height={340}>
-            {activeZone === "Both" ? (
-              <LineChart data={mergedData} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
-                <XAxis dataKey="label" tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={{ stroke: COLORS.border }} interval={Math.max(1, Math.floor(mergedData.length / 12))} />
-                <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `\u20AC${v}`} />
-                <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 12, color: COLORS.textMuted }} />
-                <Line type="monotone" dataKey="DK1" stroke={COLORS.dk1} strokeWidth={2} dot={false} name="DK1 West" />
-                <Line type="monotone" dataKey="DK2" stroke={COLORS.dk2} strokeWidth={2} dot={false} name="DK2 East" />
-              </LineChart>
-            ) : (
-              <AreaChart data={activeZone === "DK1" ? dk1Data : dk2Data} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="priceGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={activeZone === "DK1" ? COLORS.dk1 : COLORS.dk2} stopOpacity={0.3} />
-                    <stop offset="100%" stopColor={activeZone === "DK1" ? COLORS.dk1 : COLORS.dk2} stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
-                <XAxis dataKey="label" tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={{ stroke: COLORS.border }} interval={Math.max(1, Math.floor(dk1Data.length / 12))} />
-                <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `\u20AC${v}`} />
-                <Tooltip content={<CustomTooltip />} />
-                <Area type="monotone" dataKey="price" stroke={activeZone === "DK1" ? COLORS.dk1 : COLORS.dk2} strokeWidth={2} fill="url(#priceGrad)" name={`${activeZone} Price`} />
-              </AreaChart>
-            )}
-          </ResponsiveContainer>
-        </div>
-
-        {/* --- ML Forecast --- */}
-        <SectionHeader title="Price Forecast" right={<StatusDot status={displayStatus} />} />
-        <div style={{
-          background: COLORS.surface, border: `1px solid ${COLORS.border}`,
-          borderRadius: 12, padding: "20px 16px 12px",
-        }}>
-          <ForecastChart zone={activeZone === "Both" ? "DK1" : activeZone} hours={24} actualDays={2} />
-        </div>
-
-        {/* --- Pipeline Health + Quality Gate --- */}
-        <div style={{ display: "flex", gap: 14, marginTop: 8 }}>
-          {/* Connectors */}
-          <div style={{ flex: 1 }}>
-            <SectionHeader title="Data Pipeline" />
-            <div style={{
-              background: COLORS.surface, border: `1px solid ${COLORS.border}`,
-              borderRadius: 12, overflow: "hidden",
-            }}>
-              <ConnectorRow
-                name="Nord Pool — Spot Prices"
-                status={dataStatus === "fresh" ? "LIVE" : dataStatus === "stale" ? "STALE" : "OFFLINE"}
-                records={health?.spot_prices || 0}
-                lastUpdate={dataStatus === "fresh" ? "Updated 30s ago" : newestRecord ? `Last data: ${new Date(newestRecord).toLocaleDateString("da-DK")}` : "No data"}
-              />
-              <ConnectorRow
-                name="Open-Meteo — Weather Forecasts"
-                status={health?.weather_forecasts > 0 ? "LIVE" : "STALE"}
-                records={health?.weather_forecasts || 0}
-                lastUpdate="Weather features"
-              />
-              <ConnectorRow
-                name="ENTSO-E — Generation Data"
-                status={health?.generation > 0 ? "LIVE" : "STALE"}
-                records={health?.generation || 0}
-                lastUpdate={health?.generation > 0 ? "Generation mix" : "Set ENTSOE_API_KEY in .env"}
-              />
-              <div style={{ padding: "14px 16px", borderTop: `1px solid ${COLORS.border}` }}>
-                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-                  <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.text }}>Quality Gate</span>
-                  <span style={{ fontSize: 11, color: COLORS.textMuted }}>
-                    {qualityStats.passed.toLocaleString()} passed &middot; {qualityStats.warnings} warnings &middot; {qualityStats.failed} quarantined
-                  </span>
+            {/* --- Price Chart --- */}
+            <SectionHeader
+              title={`Spot Prices${dataStatus === "stale" ? " (Historical)" : ""}`}
+              right={
+                <div style={{ display: "flex", gap: 10 }}>
+                  <ZoneToggle active={activeZone} onChange={setActiveZone} />
+                  <TimeRangeSelector active={timeRange} onChange={setTimeRange} />
                 </div>
-                <QualityGateBar {...qualityStats} />
-              </div>
-            </div>
-          </div>
+              }
+            />
 
-          {/* Database Stats */}
-          <div style={{ width: 320 }}>
-            <SectionHeader title="Database" />
             <div style={{
               background: COLORS.surface, border: `1px solid ${COLORS.border}`,
-              borderRadius: 12, padding: 16,
+              borderRadius: 12, padding: "20px 16px 12px",
             }}>
-              {health && Object.entries(health).map(([table, count]) => (
-                <div key={table} style={{
-                  display: "flex", justifyContent: "space-between", padding: "8px 0",
-                  borderBottom: `1px solid ${COLORS.border}`,
+              <ResponsiveContainer width="100%" height={340}>
+                {activeZone === "Both" ? (
+                  <LineChart data={mergedData} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                    <XAxis dataKey="label" tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={{ stroke: COLORS.border }} interval={Math.max(1, Math.floor(mergedData.length / 12))} />
+                    <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `\u20AC${v}`} />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Legend wrapperStyle={{ fontSize: 12, color: COLORS.textMuted }} />
+                    <Line type="monotone" dataKey="DK1" stroke={COLORS.dk1} strokeWidth={2} dot={false} name="DK1 West" />
+                    <Line type="monotone" dataKey="DK2" stroke={COLORS.dk2} strokeWidth={2} dot={false} name="DK2 East" />
+                  </LineChart>
+                ) : (
+                  <AreaChart data={activeZone === "DK1" ? dk1Data : dk2Data} margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
+                    <defs>
+                      <linearGradient id="priceGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor={activeZone === "DK1" ? COLORS.dk1 : COLORS.dk2} stopOpacity={0.3} />
+                        <stop offset="100%" stopColor={activeZone === "DK1" ? COLORS.dk1 : COLORS.dk2} stopOpacity={0.02} />
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke={COLORS.border} />
+                    <XAxis dataKey="label" tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={{ stroke: COLORS.border }} interval={Math.max(1, Math.floor(dk1Data.length / 12))} />
+                    <YAxis tick={{ fill: COLORS.textDim, fontSize: 10 }} tickLine={false} axisLine={false} tickFormatter={v => `\u20AC${v}`} />
+                    <Tooltip content={<CustomTooltip />} />
+                    <Area type="monotone" dataKey="price" stroke={activeZone === "DK1" ? COLORS.dk1 : COLORS.dk2} strokeWidth={2} fill="url(#priceGrad)" name={`${activeZone} Price`} />
+                  </AreaChart>
+                )}
+              </ResponsiveContainer>
+            </div>
+
+            {/* --- ML Forecast --- */}
+            <SectionHeader title="Price Forecast" right={<StatusDot status={displayStatus} />} />
+            <div style={{
+              background: COLORS.surface, border: `1px solid ${COLORS.border}`,
+              borderRadius: 12, padding: "20px 16px 12px",
+            }}>
+              <ForecastChart zone={activeZone === "Both" ? "DK1" : activeZone} hours={24} actualDays={2} />
+            </div>
+
+            {/* --- Pipeline Health + Quality Gate --- */}
+            <div style={{ display: "flex", gap: 14, marginTop: 8 }}>
+              {/* Connectors */}
+              <div style={{ flex: 1 }}>
+                <SectionHeader title="Data Pipeline" />
+                <div style={{
+                  background: COLORS.surface, border: `1px solid ${COLORS.border}`,
+                  borderRadius: 12, overflow: "hidden",
                 }}>
-                  <span style={{ fontSize: 12, color: COLORS.textMuted }}>{table.replace(/_/g, " ")}</span>
-                  <span style={{ fontSize: 13, fontWeight: 700, color: count > 0 ? COLORS.text : COLORS.textDim, fontVariantNumeric: "tabular-nums" }}>
-                    {count.toLocaleString()}
-                  </span>
+                  <ConnectorRow
+                    name="Nord Pool — Spot Prices"
+                    status={dataStatus === "fresh" ? "LIVE" : dataStatus === "stale" ? "STALE" : "OFFLINE"}
+                    records={health?.spot_prices || 0}
+                    lastUpdate={dataStatus === "fresh" ? "Updated 30s ago" : newestRecord ? `Last data: ${new Date(newestRecord).toLocaleDateString("da-DK")}` : "No data"}
+                  />
+                  <ConnectorRow
+                    name="Open-Meteo — Weather Forecasts"
+                    status={health?.weather_forecasts > 0 ? "LIVE" : "STALE"}
+                    records={health?.weather_forecasts || 0}
+                    lastUpdate="Weather features"
+                  />
+                  <ConnectorRow
+                    name="ENTSO-E — Generation Data"
+                    status={health?.generation > 0 ? "LIVE" : "STALE"}
+                    records={health?.generation || 0}
+                    lastUpdate={health?.generation > 0 ? "Generation mix" : "Set ENTSOE_API_KEY in .env"}
+                  />
+                  <div style={{ padding: "14px 16px", borderTop: `1px solid ${COLORS.border}` }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.text }}>Quality Gate</span>
+                      <span style={{ fontSize: 11, color: COLORS.textMuted }}>
+                        {qualityStats.passed.toLocaleString()} passed &middot; {qualityStats.warnings} warnings &middot; {qualityStats.failed} quarantined
+                      </span>
+                    </div>
+                    <QualityGateBar {...qualityStats} />
+                  </div>
                 </div>
-              ))}
+              </div>
 
-              <div style={{ marginTop: 16, padding: "12px 14px", background: COLORS.surfaceLight, borderRadius: 8 }}>
-                <div style={{ fontSize: 11, color: COLORS.textDim, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 500 }}>Bitemporal Layer</div>
-                <div style={{ fontSize: 12, color: COLORS.textMuted, lineHeight: 1.5 }}>
-                  Every record stored with <span style={{ color: COLORS.dk1, fontWeight: 600 }}>valid_time</span> and <span style={{ color: COLORS.dk2, fontWeight: 600 }}>knowledge_time</span>.
-                  Point-in-time queries enabled for exact historical replay.
+              {/* Database Stats */}
+              <div style={{ width: 320 }}>
+                <SectionHeader title="Database" />
+                <div style={{
+                  background: COLORS.surface, border: `1px solid ${COLORS.border}`,
+                  borderRadius: 12, padding: 16,
+                }}>
+                  {health && Object.entries(health).map(([table, count]) => (
+                    <div key={table} style={{
+                      display: "flex", justifyContent: "space-between", padding: "8px 0",
+                      borderBottom: `1px solid ${COLORS.border}`,
+                    }}>
+                      <span style={{ fontSize: 12, color: COLORS.textMuted }}>{table.replace(/_/g, " ")}</span>
+                      <span style={{ fontSize: 13, fontWeight: 700, color: count > 0 ? COLORS.text : COLORS.textDim, fontVariantNumeric: "tabular-nums" }}>
+                        {count.toLocaleString()}
+                      </span>
+                    </div>
+                  ))}
+
+                  <div style={{ marginTop: 16, padding: "12px 14px", background: COLORS.surfaceLight, borderRadius: 8 }}>
+                    <div style={{ fontSize: 11, color: COLORS.textDim, marginBottom: 4, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 500 }}>Bitemporal Layer</div>
+                    <div style={{ fontSize: 12, color: COLORS.textMuted, lineHeight: 1.5 }}>
+                      Every record stored with <span style={{ color: COLORS.dk1, fontWeight: 600 }}>valid_time</span> and <span style={{ color: COLORS.dk2, fontWeight: 600 }}>knowledge_time</span>.
+                      Point-in-time queries enabled for exact historical replay.
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
+          </>
+        )}
+
+        {/* ══════ ACCURACY TAB ══════ */}
+        {activeTab === 'accuracy' && (
+          <div style={{
+            background: COLORS.surface, border: `1px solid ${COLORS.border}`,
+            borderRadius: 12, padding: "20px 16px",
+          }}>
+            <AccuracyTracker zone={activeZone === "Both" ? "DK1" : activeZone} />
           </div>
-        </div>
+        )}
+
+        {/* ══════ BACKTEST TAB ══════ */}
+        {activeTab === 'backtest' && (
+          <div style={{
+            background: COLORS.surface, border: `1px solid ${COLORS.border}`,
+            borderRadius: 12, padding: "20px 16px",
+          }}>
+            <BacktestDashboard zone={activeZone === "Both" ? "DK1" : activeZone} />
+          </div>
+        )}
+
+        {/* ══════ EXPLAINABILITY TAB ══════ */}
+        {activeTab === 'explain' && (
+          <div style={{
+            background: COLORS.surface, border: `1px solid ${COLORS.border}`,
+            borderRadius: 12, padding: "20px 16px",
+          }}>
+            <ShapExplainer zone={activeZone === "Both" ? "DK1" : activeZone} />
+          </div>
+        )}
 
         {/* --- Footer --- */}
         <div style={{ marginTop: 40, padding: "16px 0", borderTop: `1px solid ${COLORS.border}`, display: "flex", justifyContent: "space-between" }}>

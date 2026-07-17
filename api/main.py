@@ -15,6 +15,7 @@ Run locally: uvicorn api.main:app --reload --port 8000
 """
 
 import sys
+import asyncio
 import sqlite3
 import logging
 import subprocess
@@ -24,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "energylens"))
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from api.accuracy_routes import register_accuracy_routes
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,6 +63,9 @@ app.add_middleware(
 
 DB_PATH = "data/energylens.db"
 forecast_svc = ForecastService(db_path=DB_PATH, model_dir="models")
+
+# Accuracy tracking & SHAP explainability
+accuracy_engine, shap_engine = register_accuracy_routes(app)
 
 
 # --- SQLite helpers -----------------------------------------------------------
@@ -197,6 +202,28 @@ async def startup():
     counts = get_record_counts()
     logger.info(f"All tables: {counts}")
 
+    # Auto-refresh on cold start so we never serve stale baked-in data
+    asyncio.create_task(_startup_refresh())
+
+
+async def _startup_refresh():
+    """Run auto_refresh.py in background after a short delay.
+    This ensures cold-started containers pull fresh data immediately
+    without blocking the app from accepting requests."""
+    await asyncio.sleep(3)  # let the app finish initializing
+    logger.info("Cold-start refresh: pulling fresh data...")
+    try:
+        result = subprocess.run(
+            ["python", "auto_refresh.py"],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode == 0:
+            logger.info("Cold-start refresh complete — data is now fresh")
+        else:
+            logger.warning(f"Cold-start refresh failed: {result.stderr[-300:]}")
+    except Exception as e:
+        logger.warning(f"Cold-start refresh error: {e}")
+
 
 # ==============================================================================
 # HEALTH
@@ -300,17 +327,19 @@ async def compare_zones(
 # ==============================================================================
 
 @app.get("/api/forecast")
-async def get_forecast(
-    zone: str = Query("DK1", description="Bidding zone"),
-    hours: int = Query(24, ge=1, le=72, description="Forecast horizon in hours"),
-):
-    """
-    Generate a price forecast for the next N hours.
-    """
+async def forecast(zone: str = "DK1", hours: int = 24):
     result = forecast_svc.forecast(zone=zone, hours=hours)
 
-    if result.get("error"):
-        raise HTTPException(status_code=503, detail=result["error"])
+    # Log predictions for accuracy tracking
+    try:
+        accuracy_engine.log_forecast(
+            zone=zone,
+            forecasts=result.get("forecasts", []),
+            per_model=result.get("per_model", {}),
+            confidence=result.get("confidence", 0)
+        )
+    except Exception as e:
+        print(f"[AccuracyLog] Warning: {e}")
 
     return result
 
