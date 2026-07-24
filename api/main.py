@@ -28,6 +28,7 @@ from typing import Optional
 from api.accuracy_routes import register_accuracy_routes
 
 from fastapi import FastAPI, Query, HTTPException
+from pipeline.ingest import IngestionPipeline
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -361,9 +362,11 @@ async def get_forecast_models():
 async def reload_models(
     zone: Optional[str] = Query(None, description="Zone to reload, or all if omitted"),
 ):
-    """Force-reload models from disk (e.g. after retraining)."""
+    """Pull latest models from GCS, then reload from disk."""
+    from api.gcs_sync import sync_models_from_gcs
+    gcs_result = sync_models_from_gcs(local_dir="models", zone=zone)
     forecast_svc.reload_models(zone)
-    return {"status": "reloaded", "zone": zone or "all"}
+    return {"status": "reloaded", "zone": zone or "all", "gcs_sync": gcs_result}
 
 
 # ==============================================================================
@@ -372,16 +375,55 @@ async def reload_models(
 
 @app.post("/api/refresh")
 async def trigger_refresh():
-    """Trigger data refresh — called by Cloud Scheduler every 2h."""
-    result = subprocess.run(
-        ["python", "auto_refresh.py"],
-        capture_output=True, text=True, timeout=120
-    )
-    return {
-        "status": "ok" if result.returncode == 0 else "error",
-        "stdout": result.stdout[-500:] if result.stdout else "",
-        "stderr": result.stderr[-500:] if result.stderr else "",
-    }
+    """Trigger full data refresh — spot prices + weather + ENTSO-E generation.
+    Also generates and logs forecasts so accuracy/backtest accumulate data."""
+    try:
+        pipeline = IngestionPipeline()
+        await pipeline.run_latest()
+        health = pipeline.get_health()
+
+        # Generate and log forecasts for accuracy tracking
+        forecast_results = {}
+        for zone in ["DK1"]:
+            try:
+                result = forecast_svc.forecast(zone=zone, hours=24)
+                if "error" not in result:
+                    accuracy_engine.log_forecast(
+                        zone=zone,
+                        forecasts=result.get("forecasts", []),
+                        per_model=result.get("per_model", {}),
+                        confidence=result.get("confidence", 0)
+                    )
+                    forecast_results[zone] = {
+                        "logged": True,
+                        "confidence": result.get("confidence"),
+                        "models_used": result.get("models_used"),
+                    }
+                    logger.info(f"Refresh: logged {zone} forecast, confidence={result.get('confidence')}%")
+                else:
+                    forecast_results[zone] = {"logged": False, "error": result["error"]}
+            except Exception as e:
+                logger.warning(f"Refresh: {zone} forecast failed: {e}")
+                forecast_results[zone] = {"logged": False, "error": str(e)}
+
+        return {
+            "status": "ok",
+            "sources": health,
+            "forecast_logging": forecast_results,
+            "message": "Full pipeline refresh complete (spot + weather + ENTSO-E + forecast logged)"
+        }
+    except Exception as e:
+        logging.error(f"Pipeline refresh failed: {e}")
+        # Fallback to spot-only refresh
+        result = subprocess.run(
+            ["python", "auto_refresh.py"],
+            capture_output=True, text=True, timeout=120
+        )
+        return {
+            "status": "partial",
+            "message": f"Pipeline failed ({e}), fell back to spot-only refresh",
+            "stdout": result.stdout[-500:] if result.stdout else "",
+        }
 
 
 # ==============================================================================

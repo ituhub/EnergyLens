@@ -26,7 +26,7 @@ def register_accuracy_routes(app: FastAPI):
     @app.get("/api/accuracy/latest")
     async def accuracy_latest(
         zone: str = Query("DK1", description="Bidding zone"),
-        hours: int = Query(24, ge=1, le=168, description="Hours to look back")
+        hours: int = Query(24, ge=1, le=720, description="Hours to look back")
     ):
         """
         Latest accuracy metrics — predicted vs actual for recent hours.
