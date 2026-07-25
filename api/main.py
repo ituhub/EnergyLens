@@ -160,6 +160,8 @@ def get_record_counts() -> dict:
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         )
         for (table,) in cursor:
+            if table == "predictions":
+                continue
             count = conn.execute(f"SELECT COUNT(*) FROM [{table}]").fetchone()[0]
             counts[table] = count
     finally:
