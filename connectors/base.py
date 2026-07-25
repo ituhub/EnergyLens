@@ -235,7 +235,7 @@ class BaseDataProvider(ABC):
                 return cached
 
         # 2. Fetch
-        url = f"{self.base_url}/{endpoint}" if not endpoint.startswith("http") else endpoint
+        url = f"{self.base_url}/{endpoint}".rstrip("/") if not endpoint.startswith("http") else endpoint
         raw_data = await self._http_get(url, params=params)
 
         # 3. Archive

@@ -132,8 +132,13 @@ class ShapEngine:
         except ImportError:
             _models_module = None
 
+        _CLASS_ALIASES = {
+            "XGBoostModel": "XGBoostTimeSeries",
+        }
+
         class _ModelUnpickler(pickle.Unpickler):
             def find_class(self, module, name):
+                name = _CLASS_ALIASES.get(name, name)
                 if module == "__main__" and _models_module and hasattr(_models_module, name):
                     return getattr(_models_module, name)
                 return super().find_class(module, name)

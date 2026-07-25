@@ -406,8 +406,14 @@ def load_models(zone: str = "DK1", base_dir: str = "models") -> tuple[dict, dict
 
     # Custom unpickler: models trained on Kaggle have classes in __main__,
     # but locally they live in ml.models. This redirects the lookup.
+    # Class aliases: notebook class names → production class names
+    _CLASS_ALIASES = {
+        "XGBoostModel": "XGBoostTimeSeries",
+    }
+
     class _KaggleUnpickler(pickle.Unpickler):
         def find_class(self, module, name):
+            name = _CLASS_ALIASES.get(name, name)
             if module == "__main__" or module == "builtins":
                 from . import models as ml_models
                 cls = getattr(ml_models, name, None)
@@ -425,6 +431,21 @@ def load_models(zone: str = "DK1", base_dir: str = "models") -> tuple[dict, dict
             if name in nn_constructors and pt_file.exists():
                 model = nn_constructors[name]()
                 state = torch.load(pt_file, map_location="cpu", weights_only=True)
+                # Remap short checkpoint keys (Kaggle notebook) to production names
+                _KEY_REMAP = {
+                    "proj": "input_projection",
+                    "enc": "encoder",
+                    "out": "output_projection",
+                    "norm": "input_norm",
+                    "pos": "pos_encoding",
+                }
+                if any(k.split(".")[0] in _KEY_REMAP for k in state):
+                    state = {
+                        ".".join([_KEY_REMAP.get(parts[0], parts[0])] + parts[1:]): v
+                        for k, v in state.items()
+                        for parts in [k.split(".")]
+                    }
+                    logger.info(f"Remapped {name} state_dict keys (notebook → production)")
                 model.load_state_dict(state)
                 model.eval()
                 models[name] = model

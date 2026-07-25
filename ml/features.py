@@ -1,14 +1,8 @@
 """
-EnergyLens Phase 2 — Energy-specific feature engineering.
+EnergyLens — Energy-specific feature engineering.
 
-Replaces MarketLens financial indicators (RSI, MACD, Bollinger Bands, etc.)
-with features relevant to Nordic power markets:
-  • Temporal patterns (hour-of-day, day-of-week, month — cyclical encoding)
-  • Weather covariates (temperature, wind speed, solar radiation)
-  • Lag features (1h, 24h, 168h for weekly seasonality)
-  • Rolling statistics (mean, std, min, max over multiple windows)
-  • Price-derived features (returns, volatility, momentum)
-  • Demand/supply indicators (load forecast, renewable generation)
+Produces exactly 97 features matching the Kaggle-trained models.
+Close is an alias for SpotPriceEUR (prediction target, index 0).
 """
 
 import numpy as np
@@ -18,219 +12,195 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-# ── Cyclical encoding ────────────────────────────────────────────────────────
-
-def cyclical_encode(series: pd.Series, period: float) -> tuple[pd.Series, pd.Series]:
-    """Encode a periodic variable as sin/cos pair."""
-    angle = 2 * np.pi * series / period
-    return np.sin(angle), np.cos(angle)
-
-
-# ── Core feature builder ─────────────────────────────────────────────────────
-
 def build_energy_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Build a comprehensive feature set from raw energy data.
+    Build 97 features from raw energy + weather data.
 
-    Expected columns (from Phase 1 pipeline):
-        SpotPriceDKK, SpotPriceEUR   – Nord Pool spot prices
-        temperature_2m, wind_speed_10m, shortwave_radiation  – weather
-        load_forecast, renewable_generation  – ENTSO-E (optional)
+    Expected input columns:
+        SpotPriceEUR  — Nord Pool spot price
+        temperature_2m, wind_speed_10m, shortwave_radiation  — weather (optional)
 
-    The output is a DataFrame with all original columns plus engineered features.
-    Close is an alias for SpotPriceEUR (the prediction target).
+    Returns DataFrame with Close at index 0 plus 96 other features.
     """
     feat = df.copy()
 
-    # ── Determine the price target column ────────────────────────────
+    # ── Price target: Close = SpotPriceEUR ──
     price_col = None
-    for candidate in ["SpotPriceEUR", "SpotPriceDKK", "price_eur", "Close"]:
-        if candidate in feat.columns:
-            price_col = candidate
+    for c in ["SpotPriceEUR", "SpotPriceDKK", "price_eur", "Close"]:
+        if c in feat.columns:
+            price_col = c
             break
-
     if price_col is None:
-        logger.error("No price column found in data")
+        logger.error("No price column found")
         return feat
-
-    # Alias to Close for model compatibility
     if price_col != "Close":
         feat["Close"] = feat[price_col]
-
     prices = feat["Close"]
 
-    # ── 1. Temporal features ─────────────────────────────────────────
-    if hasattr(feat.index, "hour"):
-        idx = feat.index
-    else:
-        try:
-            idx = pd.to_datetime(feat.index)
-            feat.index = idx
-        except Exception:
-            logger.warning("Could not parse index as datetime; skipping temporal features")
-            idx = None
+    # ── Temporal features ──
+    if hasattr(feat.index, 'hour'):
+        h  = feat.index.hour
+        dw = feat.index.dayofweek
+        mo = feat.index.month
 
-    if idx is not None:
-        feat["hour"] = idx.hour
-        feat["hour_sin"], feat["hour_cos"] = cyclical_encode(feat["hour"], 24)
-        feat["dow"] = idx.dayofweek
-        feat["dow_sin"], feat["dow_cos"] = cyclical_encode(feat["dow"], 7)
-        feat["month"] = idx.month
-        feat["month_sin"], feat["month_cos"] = cyclical_encode(feat["month"], 12)
-        feat["quarter"] = idx.quarter
-        feat["is_weekend"] = (feat["dow"] >= 5).astype(int)
+        feat['hour']     = h
+        feat['hour_sin'] = np.sin(2 * np.pi * h / 24)
+        feat['hour_cos'] = np.cos(2 * np.pi * h / 24)
+        feat['dow']      = dw
+        feat['dow_sin']  = np.sin(2 * np.pi * dw / 7)
+        feat['dow_cos']  = np.cos(2 * np.pi * dw / 7)
+        feat['month']    = mo
+        feat['month_sin'] = np.sin(2 * np.pi * mo / 12)
+        feat['month_cos'] = np.cos(2 * np.pi * mo / 12)
+        feat['quarter']    = feat.index.quarter
+        feat['is_weekend'] = (dw >= 5).astype(float)
+        feat['is_peak_hour'] = ((h >= 8) & (h <= 20)).astype(float)
 
-        # Business hour flag (07:00-19:00 CET is peak in Nordics)
-        feat["is_peak_hour"] = ((feat["hour"] >= 7) & (feat["hour"] <= 19)).astype(int)
-
-    # ── 2. Price lag features ────────────────────────────────────────
+    # ── Price lags ──
     for lag in [1, 2, 3, 6, 12, 24, 48, 168]:
-        feat[f"price_lag_{lag}"] = prices.shift(lag)
+        feat[f'price_lag_{lag}'] = prices.shift(lag)
 
-    # ── 3. Price returns & momentum ──────────────────────────────────
-    feat["return_1h"] = prices.pct_change(1)
-    feat["return_24h"] = prices.pct_change(24)
-    feat["return_168h"] = prices.pct_change(168)
+    # ── Returns ──
+    feat['return_1h']   = prices.pct_change(1)
+    feat['return_24h']  = prices.pct_change(24)
+    feat['return_168h'] = prices.pct_change(168)
 
-    feat["momentum_6h"] = prices.diff(6)
-    feat["momentum_24h"] = prices.diff(24)
+    # ── Momentum ──
+    feat['momentum_6h']  = prices - prices.shift(6)
+    feat['momentum_24h'] = prices - prices.shift(24)
 
-    # ── 4. Rolling statistics ────────────────────────────────────────
-    for window in [6, 12, 24, 48, 168]:
-        roll = prices.rolling(window, min_periods=1)
-        feat[f"price_mean_{window}"] = roll.mean()
-        feat[f"price_std_{window}"] = roll.std()
-        feat[f"price_min_{window}"] = roll.min()
-        feat[f"price_max_{window}"] = roll.max()
+    # ── Rolling statistics ──
+    for w in [6, 12, 24, 48, 168]:
+        rm = prices.rolling(w).mean()
+        rs = prices.rolling(w).std()
+        rmin = prices.rolling(w).min()
+        rmax = prices.rolling(w).max()
 
-        # Relative position within rolling range (like Bollinger %B)
-        price_range = feat[f"price_max_{window}"] - feat[f"price_min_{window}"]
-        feat[f"price_position_{window}"] = (
-            (prices - feat[f"price_min_{window}"]) / (price_range + 1e-8)
-        )
+        feat[f'price_mean_{w}']     = rm
+        feat[f'price_std_{w}']      = rs
+        feat[f'price_min_{w}']      = rmin
+        feat[f'price_max_{w}']      = rmax
+        feat[f'price_position_{w}'] = (prices - rmin) / (rmax - rmin + 1e-8)
+        feat[f'price_zscore_{w}']   = (prices - rm) / (rs + 1e-8)
 
-        # Price distance from rolling mean (z-score)
-        feat[f"price_zscore_{window}"] = (
-            (prices - feat[f"price_mean_{window}"]) / (feat[f"price_std_{window}"] + 1e-8)
-        )
+    # ── Volatility ──
+    ret = prices.pct_change()
+    feat['volatility_6h']   = ret.rolling(6).std()
+    feat['volatility_24h']  = ret.rolling(24).std()
+    feat['volatility_168h'] = ret.rolling(168).std()
+    feat['vol_ratio_6_24']  = feat['volatility_6h'] / (feat['volatility_24h'] + 1e-8)
+    feat['vol_ratio_24_168'] = feat['volatility_24h'] / (feat['volatility_168h'] + 1e-8)
 
-    # ── 5. Volatility features ───────────────────────────────────────
-    returns = prices.pct_change().fillna(0)
-    feat["volatility_6h"] = returns.rolling(6, min_periods=1).std()
-    feat["volatility_24h"] = returns.rolling(24, min_periods=1).std()
-    feat["volatility_168h"] = returns.rolling(168, min_periods=1).std()
+    # ── Return distribution ──
+    feat['return_skew_24'] = ret.rolling(24).skew()
+    feat['return_kurt_24'] = ret.rolling(24).kurt()
 
-    # Realized volatility ratio (short vs long)
-    feat["vol_ratio_6_24"] = feat["volatility_6h"] / (feat["volatility_24h"] + 1e-8)
-    feat["vol_ratio_24_168"] = feat["volatility_24h"] / (feat["volatility_168h"] + 1e-8)
+    # ── Weather features: temperature ──
+    if 'temperature_2m' in feat.columns:
+        t = feat['temperature_2m']
+        feat['temp_lag_1']      = t.shift(1)
+        feat['temp_lag_24']     = t.shift(24)
+        feat['temp_mean_6']     = t.rolling(6).mean()
+        feat['temp_std_6']      = t.rolling(6).std()
+        feat['temp_mean_24']    = t.rolling(24).mean()
+        feat['temp_std_24']     = t.rolling(24).std()
+        feat['temp_change_1h']  = t.diff(1)
+        feat['temp_change_24h'] = t.diff(24)
+    else:
+        for c in ['temp_lag_1','temp_lag_24','temp_mean_6','temp_std_6',
+                   'temp_mean_24','temp_std_24','temp_change_1h','temp_change_24h']:
+            feat[c] = 0.0
 
-    # Return skewness and kurtosis
-    feat["return_skew_24"] = returns.rolling(24, min_periods=6).skew()
-    feat["return_kurt_24"] = returns.rolling(24, min_periods=6).kurt()
+    # ── Weather features: wind ──
+    if 'wind_speed_10m' in feat.columns:
+        w = feat['wind_speed_10m']
+        feat['wind_lag_1']      = w.shift(1)
+        feat['wind_lag_24']     = w.shift(24)
+        feat['wind_mean_6']     = w.rolling(6).mean()
+        feat['wind_std_6']      = w.rolling(6).std()
+        feat['wind_mean_24']    = w.rolling(24).mean()
+        feat['wind_std_24']     = w.rolling(24).std()
+        feat['wind_change_1h']  = w.diff(1)
+        feat['wind_change_24h'] = w.diff(24)
+    else:
+        for c in ['wind_lag_1','wind_lag_24','wind_mean_6','wind_std_6',
+                   'wind_mean_24','wind_std_24','wind_change_1h','wind_change_24h']:
+            feat[c] = 0.0
 
-    # ── 6. Weather features (if available) ───────────────────────────
-    weather_cols = {
-        "temperature_2m": "temp",
-        "wind_speed_10m": "wind",
-        "shortwave_radiation": "solar",
-    }
+    # ── Weather features: solar ──
+    if 'shortwave_radiation' in feat.columns:
+        s = feat['shortwave_radiation']
+        feat['solar_lag_1']      = s.shift(1)
+        feat['solar_lag_24']     = s.shift(24)
+        feat['solar_mean_6']     = s.rolling(6).mean()
+        feat['solar_std_6']      = s.rolling(6).std()
+        feat['solar_mean_24']    = s.rolling(24).mean()
+        feat['solar_std_24']     = s.rolling(24).std()
+        feat['solar_change_1h']  = s.diff(1)
+        feat['solar_change_24h'] = s.diff(24)
+    else:
+        for c in ['solar_lag_1','solar_lag_24','solar_mean_6','solar_std_6',
+                   'solar_mean_24','solar_std_24','solar_change_1h','solar_change_24h']:
+            feat[c] = 0.0
 
-    for raw_col, short in weather_cols.items():
-        if raw_col not in feat.columns:
-            continue
+    # ── Weather interactions ──
+    wind = feat.get('wind_speed_10m', pd.Series(0, index=feat.index))
+    temp = feat.get('temperature_2m', pd.Series(0, index=feat.index))
+    feat['wind_power_proxy'] = wind ** 3  # wind energy ~ v^3
+    feat['heating_degree']   = np.maximum(18 - temp, 0)
+    feat['cooling_degree']   = np.maximum(temp - 24, 0)
 
-        w = feat[raw_col]
-        # Lags
-        feat[f"{short}_lag_1"] = w.shift(1)
-        feat[f"{short}_lag_24"] = w.shift(24)
+    # ── Price interactions ──
 
-        # Rolling stats
-        for win in [6, 24]:
-            feat[f"{short}_mean_{win}"] = w.rolling(win, min_periods=1).mean()
-            feat[f"{short}_std_{win}"] = w.rolling(win, min_periods=1).std()
+    # ── 7b. ENTSO-E generation features ─────────────────────────────
+    if "wind_generation_mw" in feat.columns:
+        wind_gen = feat["wind_generation_mw"]
+        feat["wind_gen_lag_1"] = wind_gen.shift(1)
+        feat["wind_gen_lag_24"] = wind_gen.shift(24)
+        feat["wind_gen_change_1h"] = wind_gen.diff(1)
+        feat["wind_gen_change_24h"] = wind_gen.diff(24)
+        feat["wind_gen_mean_6"] = wind_gen.rolling(6, min_periods=1).mean()
+        feat["wind_gen_mean_24"] = wind_gen.rolling(24, min_periods=1).mean()
+        feat["wind_gen_std_24"] = wind_gen.rolling(24, min_periods=1).std()
+        feat["price_wind_gen_ratio"] = prices / (wind_gen + 1e-8)
 
-        # Change features
-        feat[f"{short}_change_1h"] = w.diff(1)
-        feat[f"{short}_change_24h"] = w.diff(24)
+    if "solar_generation_mw" in feat.columns:
+        solar_gen = feat["solar_generation_mw"]
+        feat["solar_gen_lag_1"] = solar_gen.shift(1)
+        feat["solar_gen_lag_24"] = solar_gen.shift(24)
+        feat["solar_gen_mean_6"] = solar_gen.rolling(6, min_periods=1).mean()
 
-    # Wind power proxy (wind^3 approximates power output)
-    if "wind_speed_10m" in feat.columns:
-        feat["wind_power_proxy"] = feat["wind_speed_10m"] ** 3
+    if "total_generation_mw" in feat.columns:
+        total_gen = feat["total_generation_mw"]
+        feat["total_gen_lag_1"] = total_gen.shift(1)
+        feat["total_gen_lag_24"] = total_gen.shift(24)
+        feat["total_gen_mean_24"] = total_gen.rolling(24, min_periods=1).mean()
+        feat["total_gen_change_24h"] = total_gen.diff(24)
+        feat["price_per_gen_mw"] = prices / (total_gen + 1e-8)
 
-    # Heating degree hours (below 18°C → more demand)
-    if "temperature_2m" in feat.columns:
-        feat["heating_degree"] = np.maximum(0, 18.0 - feat["temperature_2m"])
-        feat["cooling_degree"] = np.maximum(0, feat["temperature_2m"] - 24.0)
+    feat['spike_indicator']       = (prices > prices.rolling(24).mean() + 2 * prices.rolling(24).std()).astype(float)
+    feat['temp_peak_interaction'] = temp * feat.get('is_peak_hour', 0)
+    feat['wind_price_interaction'] = wind * prices
 
-    # ── 7. Demand / supply features (if available) ───────────────────
-    if "load_forecast" in feat.columns:
-        load = feat["load_forecast"]
-        feat["load_lag_24"] = load.shift(24)
-        feat["load_change_24h"] = load.diff(24)
-        feat["load_mean_24"] = load.rolling(24, min_periods=1).mean()
-
-        # Price per unit load (merit-order proxy)
-        feat["price_per_load"] = prices / (load + 1e-8)
-
-    if "renewable_generation" in feat.columns:
-        ren = feat["renewable_generation"]
-        feat["renewable_share"] = ren / (feat.get("load_forecast", ren) + 1e-8)
-        feat["renewable_lag_24"] = ren.shift(24)
-
-    # ── 8. Price spike indicator ─────────────────────────────────────
-    # Useful for the model to learn extreme events
-    rolling_mean_24 = prices.rolling(24, min_periods=1).mean()
-    rolling_std_24 = prices.rolling(24, min_periods=1).std()
-    feat["spike_indicator"] = (
-        (prices > rolling_mean_24 + 2 * rolling_std_24) |
-        (prices < rolling_mean_24 - 2 * rolling_std_24)
-    ).astype(int)
-
-    # ── 9. Cross-feature interactions ────────────────────────────────
-    if "temperature_2m" in feat.columns and "is_peak_hour" in feat.columns:
-        feat["temp_peak_interaction"] = feat["temperature_2m"] * feat["is_peak_hour"]
-
-    if "wind_speed_10m" in feat.columns:
-        feat["wind_price_interaction"] = feat["wind_speed_10m"] * feat["return_1h"].fillna(0)
-
-    # ── Cleanup ──────────────────────────────────────────────────────
-    # Forward-fill, backward-fill, then zero for any remaining NaN
-    feat = feat.ffill().bfill().fillna(0)
-
-    # Keep only numeric columns
-    numeric_cols = feat.select_dtypes(include=[np.number]).columns
-    feat = feat[numeric_cols]
-
-    # Replace infinities
-    feat = feat.replace([np.inf, -np.inf], np.nan).fillna(0)
+    # ── Clean up ──
+    feat = feat.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
+    feat = feat.select_dtypes(include=[np.number])
 
     logger.info(f"Built {len(feat.columns)} features from {len(feat)} rows")
     return feat
 
 
 def get_energy_price_range(zone: str = "DK1") -> tuple[float, float]:
-    """
-    Return reasonable EUR/MWh price range for a Nordic bidding zone.
-    These are wide fallback ranges — dynamic ranges from training data are preferred.
-    """
+    """Reasonable price range for Nordic bidding zones."""
     ranges = {
-        "DK1": (-50, 500),    # Denmark West (can go negative with wind oversupply)
-        "DK2": (-50, 500),    # Denmark East
-        "NO1": (-20, 400),    # Norway South
-        "NO2": (-20, 400),
-        "SE1": (-30, 300),    # Sweden North
-        "SE3": (-30, 450),    # Sweden South
-        "FI":  (-30, 400),    # Finland
+        "DK1": (-500, 1000), "DK2": (-500, 1000),
+        "NO1": (-200, 800),  "NO2": (-200, 800),
+        "SE1": (-200, 800),  "SE3": (-200, 800),
+        "FI":  (-200, 1000),
     }
-    return ranges.get(zone, (-50, 500))
+    return ranges.get(zone, (-500, 1000))
 
 
 def get_max_step_change(zone: str = "DK1") -> float:
-    """
-    Maximum reasonable per-step forecast change as a fraction.
-    Energy prices are more volatile than most financial assets
-    (can go from 30 to 300 EUR/MWh in hours during supply crises).
-    """
-    # Energy prices can swing wildly, but consecutive hourly steps
-    # rarely exceed 50% change from base under normal conditions.
+    """Max allowed per-step price change (EUR/MWh)."""
     return 0.50

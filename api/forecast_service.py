@@ -142,12 +142,56 @@ class ForecastService:
         except Exception:
             weather_hourly = pd.DataFrame()
 
+
+        # Load generation data (ENTSO-E)
+        gen_hourly = pd.DataFrame()
+        try:
+            gen_raw = pd.read_sql_query(
+                """
+                SELECT valid_time AS time, generation_type, value_mw
+                FROM generation
+                WHERE zone = ?
+                ORDER BY valid_time DESC
+                LIMIT ?
+                """,
+                conn,
+                params=(zone, lookback_hours * 10),
+                parse_dates=["time"],
+            )
+            if len(gen_raw) > 0:
+                gen_raw = gen_raw.sort_values("time")
+                gen_pivot = gen_raw.pivot_table(
+                    index="time", columns="generation_type",
+                    values="value_mw", aggfunc="mean"
+                )
+                wind_cols = [c for c in gen_pivot.columns if "wind" in c.lower()]
+                solar_cols = [c for c in gen_pivot.columns if "solar" in c.lower()]
+                gen_hourly = pd.DataFrame(index=gen_pivot.index)
+                if wind_cols:
+                    gen_hourly["wind_generation_mw"] = gen_pivot[wind_cols].sum(axis=1)
+                if solar_cols:
+                    gen_hourly["solar_generation_mw"] = gen_pivot[solar_cols].sum(axis=1)
+                renewable_cols = wind_cols + solar_cols
+                if renewable_cols:
+                    gen_hourly["renewable_generation"] = gen_pivot[renewable_cols].sum(axis=1)
+                gen_hourly["total_generation_mw"] = gen_pivot.sum(axis=1)
+                for col in gen_pivot.columns:
+                    gen_hourly[f"gen_{col}"] = gen_pivot[col]
+                gen_hourly = gen_hourly.resample("h").mean()
+                logger.info(f"Loaded {len(gen_hourly)} generation rows for {zone}")
+        except Exception as e:
+            logger.debug(f"Generation data not available: {e}")
+
         conn.close()
 
+
+        merged = prices_df
+
         if not weather_hourly.empty:
-            merged = prices_df.join(weather_hourly, how="left")
-        else:
-            merged = prices_df
+            merged = merged.join(weather_hourly, how="left")
+
+        if not gen_hourly.empty:
+            merged = merged.join(gen_hourly, how="left")
 
         merged = merged.sort_index().dropna(subset=["SpotPriceEUR"])
         logger.info(f"Loaded {len(merged)} hourly rows for {zone}")
@@ -186,6 +230,7 @@ class ForecastService:
         used_features = config.get("used_features", [])
         price_range = config.get("price_range")
         cv_weights = config.get("ensemble_weights")
+        use_differencing = config.get("use_differencing", False)
 
         # 2. Load recent data
         # We need time_step + buffer for feature building (lags up to 168h)
@@ -211,6 +256,16 @@ class ForecastService:
             last_timestamp = last_timestamp.replace(tzinfo=timezone.utc)
 
         logger.info(f"Current price for {zone}: EUR {current_price:.2f}")
+
+         # ── Compute recent 24h price range for smarter catastrophic filter ──
+        # Nordic intraday swings can be 10x (€170 → €10 same day).
+        # Anchoring the filter only on current_price kills all models
+        # during these swings.
+        recent_24h = raw_df["SpotPriceEUR"].iloc[-24:] if len(raw_df) >= 24 else raw_df["SpotPriceEUR"]
+        recent_price_range = (float(recent_24h.min()), float(recent_24h.max()))
+        logger.info(
+            f"Recent 24h range for {zone}: €{recent_price_range[0]:.2f} – €{recent_price_range[1]:.2f}"
+        )
 
         # When price is near zero/negative (common in high-wind Nordic periods),
         # use median of price_range for ensemble filtering to avoid
@@ -258,7 +313,15 @@ class ForecastService:
             cv_weights=cv_weights,
             price_range=None,
             current_price=current_price,
+            recent_price_range=recent_price_range,
         )
+
+        # If models were trained with differencing, their output is a price
+        # CHANGE, not an absolute price. Add current_price to reconstruct.
+        if use_differencing:
+            logger.info(f"Differencing mode: adjusting predictions by base price €{current_price:.2f}")
+            next_price = current_price + next_price
+            per_model = {k: current_price + v for k, v in per_model.items()}
 
         confidence = calculate_confidence(per_model, zone) if per_model else 50.0
 
@@ -270,7 +333,40 @@ class ForecastService:
             price_range=None,  # disabled: avoids CATASTROPHIC on near-zero prices
             feature_names=used_features,
             last_timestamp=last_timestamp,
+            current_price=current_price,
+            recent_price_range=recent_price_range,
         )
+
+        # For differencing: each forecast step is a change — accumulate
+        if use_differencing:
+            accumulated = []
+            base = current_price
+            for change in forecast_prices:
+                base = base + change
+                accumulated.append(base)
+            forecast_prices = accumulated
+
+        # 6b. Naive fallback when all ML models fail
+        if not forecast_prices:
+            logger.warning("All ML models failed — generating naive fallback forecast")
+            # Use same-hour-yesterday prices as baseline, fall back to current_price
+            fallback_prices = []
+            for i in range(1, hours + 1):
+                target_hour = (last_timestamp.hour + i) % 24
+                same_hour = raw_df["SpotPriceEUR"].iloc[-48:][
+                    raw_df.index[-48:].hour == target_hour
+                ]
+                if len(same_hour) > 0:
+                    fallback_prices.append(float(same_hour.mean()))
+                else:
+                    fallback_prices.append(current_price)
+            forecast_prices = fallback_prices
+            per_model["_fallback"] = "naive_same_hour_avg"
+            confidence = 25.0
+            logger.info(
+                f"Naive fallback: {len(forecast_prices)} steps, "
+                f"range €{min(forecast_prices):.2f}–€{max(forecast_prices):.2f}"
+            )    
 
         # 7. Quality Gate evaluation
         quality_gate = evaluate_quality_gate(

@@ -100,6 +100,9 @@ class IngestionPipeline:
         # Historical weather
         await self._backfill_weather(days)
 
+        # Historical generation (ENTSO-E)
+        await self._backfill_generation(days)
+
         self._log_summary()
 
     # ─── Spot Prices ───
@@ -241,11 +244,39 @@ class IngestionPipeline:
                 records = await self.entsoe.get_generation_forecast(zone=zone)
                 self.stats["fetched"] += len(records)
                 self.stats["passed"] += len(records)
-                total += len(records)
-                logger.info(f"Generation: {len(records)} records for {zone}")
+                if records:
+                    count = self.db.insert_generation(records, zone)
+                    total += count
+                logger.info(f"Generation: {len(records)} fetched, {count if records else 0} inserted for {zone}")
             except Exception as e:
                 logger.warning(f"ENTSO-E fetch failed for {zone}: {e}")
 
+        return total
+
+    async def _backfill_generation(self, days: int) -> int:
+        """Backfill historical generation data from ENTSO-E."""
+        logger.info(f"Backfilling {days} days of generation data...")
+        from config.constants import ACTIVE_ZONES
+        from datetime import timedelta
+        total = 0
+        now = datetime.now(timezone.utc)
+        for zone in ACTIVE_ZONES:
+            for day_offset in range(days):
+                target = now - timedelta(days=day_offset)
+                try:
+                    records = await self.entsoe.get_generation_forecast(zone=zone, date=target)
+                    if records:
+                        total += self.db.insert_generation(records, zone)
+                    actual = await self.entsoe.get_actual_generation(zone=zone, date=target)
+                    if actual:
+                        for r in actual: r["is_forecast"] = False
+                        total += self.db.insert_generation(actual, zone)
+                    if day_offset % 30 == 0:
+                        logger.info(f"  Gen backfill: {zone} day {day_offset}/{days}, total={total}")
+                except Exception as e:
+                    logger.warning(f"Gen backfill failed {zone} day {day_offset}: {e}")
+                await asyncio.sleep(0.3)
+        logger.info(f"Generation backfill complete: {total} records")
         return total
 
     # ─── Health & Summary ───

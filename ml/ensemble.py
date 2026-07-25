@@ -91,6 +91,7 @@ def ensemble_predict(
     cv_weights: dict | None = None,
     price_range: tuple[float, float] | None = None,
     current_price: float | None = None,
+    recent_price_range: tuple[float, float] | None = None,
 ) -> tuple[float | None, dict]:
     """
     Run all models, apply safety rails, return (final_price, per_model_preds).
@@ -143,10 +144,29 @@ def ensemble_predict(
             # Skip when price is near zero/negative (common in Nordic wind oversupply)
             if current_price is not None and abs(current_price) > 5.0:
                 deviation = abs(pred_eur - current_price) / (abs(current_price) + 1e-8)
-                if deviation > 0.50:
+                # Hybrid threshold: 50% relative, but at least €30 absolute.
+                # ALSO factor in recent 24h price span — Nordic intraday
+                # swings can be 10x (€170 → €10) and predictions reflecting
+                # recent prices aren't truly catastrophic.
+                abs_limit = max(abs(current_price) * 0.50, 30.0)
+                if recent_price_range is not None:
+                    recent_low, recent_high = recent_price_range
+                    price_span = recent_high - recent_low
+                    # Allow predictions within 50% of the recent 24h span
+                    span_limit = price_span * 0.50
+                    abs_limit = max(abs_limit, span_limit)
+                    # Hard ceiling: never allow predictions above 120% of 24h high
+                    hard_ceiling = max(recent_high * 1.20, recent_high + 30.0)
+                    if pred_eur > hard_ceiling:
+                        logger.warning(
+                            f"CATASTROPHIC: {name} → €{pred_eur:.2f} exceeds "
+                            f"120% of 24h high €{recent_high:.2f} — EXCLUDED"
+                        )
+                        continue
+                if abs(pred_eur - current_price) > abs_limit:
                     logger.warning(
                         f"CATASTROPHIC: {name} → €{pred_eur:.2f} vs current €{current_price:.2f} "
-                        f"({deviation:.0%} off) — EXCLUDED"
+                        f"({deviation:.0%} off, limit €{abs_limit:.0f}) — EXCLUDED"
                     )
                     continue
 
@@ -196,6 +216,9 @@ def ensemble_predict(
     total_weight = 0.0
     for name, pred in predictions_for_ensemble.items():
         w = weights.get(name, 1.0 / len(predictions_for_ensemble))
+        # Config stores weights as {'mean': float, 'std': float} — extract mean
+        if isinstance(w, dict):
+            w = w.get('mean', 1.0 / len(predictions_for_ensemble))
         weighted_sum += pred * w
         total_weight += w
 
@@ -230,6 +253,8 @@ def multi_step_forecast(
     price_range: tuple[float, float] | None = None,
     feature_names: list[str] | None = None,
     last_timestamp=None,
+    current_price: float | None = None,
+    recent_price_range: tuple[float, float] | None = None,
 ) -> list[float]:
     """
     Generate a multi-step (e.g. 24-hour) forecast with per-step clamping.
@@ -287,6 +312,7 @@ def multi_step_forecast(
                 active_models, curr_seq, scaler, zone,
                 cv_weights=cv_weights, price_range=price_range,
                 current_price=base_price,
+                recent_price_range=recent_price_range,
             )
 
             # Update frozen-model tracking

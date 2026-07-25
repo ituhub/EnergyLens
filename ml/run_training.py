@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 def load_data_from_sqlite(db_path: str, zone: str = "DK1") -> pd.DataFrame | None:
     """
-    Load spot prices and weather data from Phase 1 SQLite database
+    Load spot prices, weather, and generation data from SQLite database
     and merge into a single DataFrame indexed by hour.
     """
     db = Path(db_path)
@@ -48,6 +48,7 @@ def load_data_from_sqlite(db_path: str, zone: str = "DK1") -> pd.DataFrame | Non
 
     # ── Load spot prices ─────────────────────────────────────────────
     try:
+        # Try Phase 1 schema first (HourUTC, PriceArea)
         prices_df = pd.read_sql_query(
             """
             SELECT HourUTC, SpotPriceEUR, SpotPriceDKK
@@ -60,43 +61,102 @@ def load_data_from_sqlite(db_path: str, zone: str = "DK1") -> pd.DataFrame | Non
             parse_dates=["HourUTC"],
         )
         prices_df = prices_df.set_index("HourUTC")
-        logger.info(f"Loaded {len(prices_df)} price records for {zone}")
-    except Exception as e:
-        logger.error(f"Failed to load prices: {e}")
-        conn.close()
-        return None
+    except Exception:
+        # Fall back to production schema (valid_time, zone)
+        try:
+            prices_df = pd.read_sql_query(
+                """
+                SELECT valid_time AS HourUTC,
+                       price_eur_mwh AS SpotPriceEUR,
+                       price_dkk_mwh AS SpotPriceDKK
+                FROM spot_prices
+                WHERE zone = ?
+                ORDER BY valid_time
+                """,
+                conn,
+                params=(zone,),
+                parse_dates=["HourUTC"],
+            )
+            prices_df = prices_df.set_index("HourUTC")
+            prices_df = prices_df.resample("h").mean().dropna()
+        except Exception as e:
+            logger.error(f"Failed to load prices: {e}")
+            conn.close()
+            return None
+
+    logger.info(f"Loaded {len(prices_df)} price records for {zone}")
 
     # ── Load weather data ────────────────────────────────────────────
+    weather_df = pd.DataFrame()
+    for table, time_col in [("weather_data", "time"), ("weather_forecasts", "valid_time")]:
+        try:
+            cols_info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            col_names = [r[1] for r in cols_info]
+            select_parts = [f"{time_col} AS time"]
+            for c in ["temperature_2m", "wind_speed_10m", "shortwave_radiation"]:
+                if c in col_names:
+                    select_parts.append(c)
+            if len(select_parts) > 1:
+                q = "SELECT " + ", ".join(select_parts) + f" FROM {table} ORDER BY {time_col}"
+                weather_df = pd.read_sql_query(q, conn, parse_dates=["time"])
+                weather_df = weather_df.set_index("time")
+                logger.info(f"Loaded {len(weather_df)} weather records from {table}")
+                break
+        except Exception:
+            continue
+
+    # ── Load generation data (ENTSO-E) ───────────────────────────────
+    gen_df = pd.DataFrame()
     try:
-        weather_df = pd.read_sql_query(
+        gen_raw = pd.read_sql_query(
             """
-            SELECT time, temperature_2m, wind_speed_10m, shortwave_radiation
-            FROM weather_data
-            ORDER BY time
+            SELECT valid_time AS time, generation_type, value_mw
+            FROM generation
+            WHERE zone = ?
+            ORDER BY valid_time
             """,
             conn,
+            params=(zone,),
             parse_dates=["time"],
         )
-        weather_df = weather_df.set_index("time")
-        logger.info(f"Loaded {len(weather_df)} weather records")
+        if len(gen_raw) > 0:
+            gen_pivot = gen_raw.pivot_table(
+                index="time", columns="generation_type",
+                values="value_mw", aggfunc="mean"
+            )
+            wind_cols = [c for c in gen_pivot.columns if "wind" in c.lower()]
+            solar_cols = [c for c in gen_pivot.columns if "solar" in c.lower()]
+            gen_df = pd.DataFrame(index=gen_pivot.index)
+            if wind_cols:
+                gen_df["wind_generation_mw"] = gen_pivot[wind_cols].sum(axis=1)
+            if solar_cols:
+                gen_df["solar_generation_mw"] = gen_pivot[solar_cols].sum(axis=1)
+            renewable_cols = wind_cols + solar_cols
+            if renewable_cols:
+                gen_df["renewable_generation"] = gen_pivot[renewable_cols].sum(axis=1)
+            gen_df["total_generation_mw"] = gen_pivot.sum(axis=1)
+            for col in gen_pivot.columns:
+                gen_df[f"gen_{col}"] = gen_pivot[col]
+            gen_df = gen_df.resample("h").mean()
+            logger.info(f"Loaded {len(gen_df)} generation records for {zone}")
+        else:
+            logger.warning(f"No generation data found for {zone}")
     except Exception as e:
-        logger.warning(f"Weather data not available: {e}")
-        weather_df = pd.DataFrame()
+        logger.warning(f"Generation data not available: {e}")
 
     conn.close()
 
     # ── Merge on hourly index ────────────────────────────────────────
+    merged = prices_df
     if not weather_df.empty:
-        # Resample weather to hourly (in case of sub-hourly data)
         weather_hourly = weather_df.resample("h").mean()
-        merged = prices_df.join(weather_hourly, how="left")
-    else:
-        merged = prices_df
-
+        merged = merged.join(weather_hourly, how="left")
+    if not gen_df.empty:
+        merged = merged.join(gen_df, how="left")
+        logger.info(f"Added generation features: {list(gen_df.columns)}")
     merged = merged.sort_index().dropna(subset=["SpotPriceEUR"])
     logger.info(f"Merged dataset: {len(merged)} rows, {len(merged.columns)} columns")
     return merged
-
 
 def main():
     parser = argparse.ArgumentParser(description="Train EnergyLens ML models")

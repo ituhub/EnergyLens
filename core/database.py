@@ -344,6 +344,56 @@ class Database:
         logger.info(f"Inserted {count} weather records for {location_key}")
         return count
 
+    def insert_generation(self, records: list[dict], zone: str) -> int:
+        """Insert generation forecast records from ENTSO-E."""
+        now = datetime.now(timezone.utc).isoformat()
+        count = 0
+        with self.connection() as conn:
+            cur = conn.cursor()
+            placeholder = "%s" if self.use_postgres else "?"
+            for record in records:
+                try:
+                    sql = f"""
+                        INSERT OR IGNORE INTO generation
+                            (valid_time, knowledge_time, zone,
+                             generation_type, value_mw, is_forecast, source)
+                        VALUES ({', '.join([placeholder] * 7)})
+                    """
+                    cur.execute(sql, (
+                        record.get("timestamp_utc"),
+                        now,
+                        zone,
+                        record.get("generation_type"),
+                        record.get("value_mw"),
+                        1,
+                        record.get("source", "entsoe"),
+                    ))
+                    count += 1
+                except Exception as e:
+                    logger.error(f"Generation insert failed: {e}")
+            conn.commit()
+        logger.info(f"Inserted {count} generation records for {zone}")
+        return count
+
+
+    def get_generation_data(self, zone, start=None, end=None):
+        """Get generation data for a zone, optionally within a time range."""
+        with self.connection() as conn:
+            cur = conn.cursor()
+            ph = "%s" if self.use_postgres else "?"
+            sql = f"SELECT valid_time, generation_type, value_mw, is_forecast FROM generation WHERE zone = {ph}"
+            params = [zone]
+            if start:
+                sql += f" AND valid_time >= {ph}"
+                params.append(start)
+            if end:
+                sql += f" AND valid_time <= {ph}"
+                params.append(end)
+            sql += " ORDER BY valid_time"
+            cur.execute(sql, params)
+            columns = [d[0] for d in cur.description]
+            return [dict(zip(columns, row)) for row in cur.fetchall()]
+
     def quarantine_record(self, record: dict, quality_report: dict) -> None:
         """Store a failed record in quarantine."""
         with self.connection() as conn:
