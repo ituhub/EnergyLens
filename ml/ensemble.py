@@ -142,7 +142,7 @@ def ensemble_predict(
 
             # ── SAFETY RAIL 1: Catastrophic exclusion ────────────────
             # Skip when price is near zero/negative (common in Nordic wind oversupply)
-            if current_price is not None and abs(current_price) > 5.0:
+            if current_price is not None and abs(current_price) > 20.0:
                 deviation = abs(pred_eur - current_price) / (abs(current_price) + 1e-8)
                 # Hybrid threshold: 50% relative, but at least €30 absolute.
                 # ALSO factor in recent 24h price span — Nordic intraday
@@ -337,7 +337,7 @@ def multi_step_forecast(
             # percentage-based clamping — a €0.01 base can never reach €80.
             # Fix: use absolute EUR cap when base_price is small.
             MIN_ABS_STEP = 50.0  # EUR — Nordic prices swing €50+/hour during wind events
-            NEAR_ZERO_THRESHOLD = 10.0  # EUR — below this, use absolute mode
+            NEAR_ZERO_THRESHOLD = 20.0  # EUR — below this, use absolute mode
 
             if base_price is not None:
                 max_cumulative = max_change * (1 + step * 0.15)
