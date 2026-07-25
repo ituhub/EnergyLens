@@ -498,7 +498,7 @@ class Database:
 
     def get_record_counts(self) -> dict:
         """Get record counts for all tables — useful for dashboard."""
-        tables = ["spot_prices", "weather_forecasts", "generation", "quality_quarantine", "predictions"]
+        tables = ["spot_prices", "weather_forecasts", "generation", "quality_quarantine", "forecast_log"]
         counts = {}
 
         with self.connection() as conn:
