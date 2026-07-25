@@ -160,6 +160,7 @@ class ForecastService:
             )
             if len(gen_raw) > 0:
                 gen_raw = gen_raw.sort_values("time")
+                gen_raw["time"] = pd.to_datetime(gen_raw["time"], utc=True).dt.tz_localize(None)
                 gen_pivot = gen_raw.pivot_table(
                     index="time", columns="generation_type",
                     values="value_mw", aggfunc="mean"
