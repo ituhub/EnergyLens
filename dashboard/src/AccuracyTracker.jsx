@@ -177,7 +177,7 @@ const CustomTooltip = ({ active, payload, label }) => {
 
 export default function AccuracyTracker({ zone = 'DK1' }) {
   const [data, setData] = useState(null);
-  const [hours, setHours] = useState(24);
+  const [hours, setHours] = useState(720);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
