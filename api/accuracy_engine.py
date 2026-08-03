@@ -123,6 +123,7 @@ class AccuracyEngine:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours_back)).isoformat()
 
         # Get the most recent forecast for each hour (latest generated_at)
+        # Join rounds spot prices to the hour to handle 15-min data
         query = """
             WITH latest_forecast AS (
                 SELECT
@@ -138,15 +139,23 @@ class AccuracyEngine:
                 WHERE zone = ?
                   AND model_name = ?
                   AND forecast_hour >= ?
+            ),
+            hourly_prices AS (
+                SELECT
+                    zone,
+                    SUBSTR(valid_time, 1, 14) || '00:00' AS hour_ts,
+                    AVG(price_eur_mwh) AS price_eur_mwh
+                FROM spot_prices
+                GROUP BY zone, SUBSTR(valid_time, 1, 14) || '00:00'
             )
             SELECT
                 lf.forecast_hour,
                 lf.predicted_price,
-                sp.price_eur_mwh AS actual_price
+                hp.price_eur_mwh AS actual_price
             FROM latest_forecast lf
-            JOIN spot_prices sp
-                ON lf.forecast_hour = sp.valid_time
-                AND lf.zone = sp.zone
+            JOIN hourly_prices hp
+                ON lf.forecast_hour = hp.hour_ts
+                AND lf.zone = hp.zone
             WHERE lf.rn = 1
             ORDER BY lf.forecast_hour
         """
@@ -270,11 +279,12 @@ class AccuracyEngine:
             metrics = self._compute_metrics(pairs)
 
             # Detect frozen models (all predictions identical)
-            if pairs:
+            # No matched pairs = unknown, not frozen
+            if len(pairs) >= 2:
                 prices = [p[1] for p in pairs]
                 is_frozen = len(set(round(p, 2) for p in prices)) <= 1
             else:
-                is_frozen = True
+                is_frozen = False
 
             result[model] = {**metrics, "frozen": is_frozen}
 
@@ -310,7 +320,7 @@ class AccuracyEngine:
                 sp.price_eur_mwh AS actual_price
             FROM latest_forecast lf
             JOIN spot_prices sp
-                ON lf.forecast_hour = sp.valid_time
+                ON REPLACE(lf.forecast_hour, 'T', ' ') = REPLACE(sp.valid_time, 'T', ' ')
                 AND lf.zone = sp.zone
             WHERE lf.rn = 1
             ORDER BY lf.forecast_hour
@@ -428,7 +438,7 @@ class AccuracyEngine:
                     AVG(ABS(lf.predicted_price - sp.price_eur_mwh)) AS daily_mae
                 FROM latest_forecast lf
                 JOIN spot_prices sp
-                    ON lf.forecast_hour = sp.valid_time
+                    ON REPLACE(lf.forecast_hour, 'T', ' ') = REPLACE(sp.valid_time, 'T', ' ')
                     AND lf.zone = sp.zone
                 WHERE lf.rn = 1
                 GROUP BY forecast_date
@@ -465,12 +475,12 @@ class AccuracyEngine:
             pairs = self._get_pairs(zone, days * 24, model)
             metrics = self._compute_metrics(pairs)
 
-            # Detect frozen
-            if pairs:
+            # Detect frozen — need at least 2 pairs to judge
+            if len(pairs) >= 2:
                 prices = [p[1] for p in pairs]
                 is_frozen = len(set(round(p, 2) for p in prices)) <= 1
             else:
-                is_frozen = True
+                is_frozen = False
 
             leaderboard.append({
                 "model_name": model,

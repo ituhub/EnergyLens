@@ -4,6 +4,9 @@ EnergyLens — FastAPI backend API.
 Serves spot prices, forecasts, pipeline health, and quality metrics
 to the React dashboard frontend.
 
+v0.5.0 — Adds: Firebase Auth, Firestore user registration, admin panel,
+          structured JSON logging, pipeline tracing.
+
 Data freshness logic:
   - Price endpoints first try the requested date range (e.g. last 48h)
   - If no rows match (data is stale), falls back to the most recent
@@ -17,7 +20,6 @@ Run locally: uvicorn api.main:app --reload --port 8000
 import sys
 import asyncio
 import sqlite3
-import logging
 import subprocess
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -27,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from api.accuracy_routes import register_accuracy_routes
 
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends
 from pipeline.ingest import IngestionPipeline
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -35,17 +37,20 @@ from fastapi.responses import FileResponse
 
 from api.forecast_service import ForecastService
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("energylens.api")
+# --- Structured logging (replaces basicConfig) --------------------------------
+from api.logging_config import setup_logging, get_logger
+setup_logging()
+logger = get_logger("energylens.api")
+
+# --- Auth & Admin imports -----------------------------------------------------
+from api.auth import get_current_user, require_auth, require_admin, increment_prediction_count
+from api.admin import register_admin_routes
+
 
 app = FastAPI(
     title="EnergyLens API",
     description="Energy market forecasting platform API",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 # CORS — allow React dev server and deployed frontend
@@ -63,10 +68,22 @@ app.add_middleware(
 )
 
 DB_PATH = "data/energylens.db"
+
+# Restore database from GCS on startup (survives redeploys)
+try:
+    from api.gcs_sync import download_db_from_gcs
+    _db_restore = download_db_from_gcs(DB_PATH)
+    logger.info(f"DB restore: {_db_restore.get('status')}")
+except Exception as _e:
+    logger.warning(f"DB restore skipped: {_e}")
+
 forecast_svc = ForecastService(db_path=DB_PATH, model_dir="models")
 
 # Accuracy tracking & SHAP explainability
 accuracy_engine, shap_engine = register_accuracy_routes(app)
+
+# Admin routes
+register_admin_routes(app)
 
 
 # --- SQLite helpers -----------------------------------------------------------
@@ -117,7 +134,6 @@ def get_zone_prices(zone: str, start_iso: str, end_iso: str) -> tuple[list[dict]
         return records, "fresh"
 
     # Fallback: get the most recent N rows regardless of date
-    # Calculate how many hours were requested
     try:
         start_dt = datetime.fromisoformat(start_iso)
         end_dt = datetime.fromisoformat(end_iso)
@@ -210,26 +226,45 @@ async def startup():
 
 
 async def _startup_refresh():
-    """Run auto_refresh.py in background after a short delay.
-    This ensures cold-started containers pull fresh data immediately
-    without blocking the app from accepting requests."""
-    await asyncio.sleep(3)  # let the app finish initializing
-    logger.info("Cold-start refresh: pulling fresh data...")
+    """Run ingestion pipeline on cold start with gap-aware spot price fetch."""
+    await asyncio.sleep(3)
+    logger.info("Cold-start refresh: checking for data gaps...")
     try:
-        result = subprocess.run(
-            ["python", "auto_refresh.py"],
-            capture_output=True, text=True, timeout=120
-        )
-        if result.returncode == 0:
-            logger.info("Cold-start refresh complete — data is now fresh")
-        else:
-            logger.warning(f"Cold-start refresh failed: {result.stderr[-300:]}")
+        # Detect how stale spot prices are
+        bounds = get_data_bounds()
+        days_back = 7  # default
+        if bounds["newest"]:
+            try:
+                newest_str = bounds["newest"].replace("T", " ").split("+")[0]
+                newest_dt = datetime.fromisoformat(newest_str)
+                gap_days = (datetime.utcnow() - newest_dt).total_seconds() / 86400
+                if gap_days > 2:
+                    days_back = min(int(gap_days) + 2, 30)
+                    logger.info(f"Spot price gap: {gap_days:.1f} days — fetching {days_back} days")
+            except Exception:
+                pass
+
+        pipeline = IngestionPipeline()
+        # Widen the spot price fetch for this startup run
+        pipeline._spot_days_override = days_back
+        await pipeline.run_latest()
+        logger.info(f"Cold-start refresh complete — fetched {days_back} days of spot prices")
     except Exception as e:
         logger.warning(f"Cold-start refresh error: {e}")
 
 
 # ==============================================================================
-# HEALTH
+# AUTH
+# ==============================================================================
+
+@app.get("/api/auth/me")
+async def auth_me(user=Depends(require_auth)):
+    """Return the authenticated user's profile (role, email, etc.)."""
+    return user
+
+
+# ==============================================================================
+# HEALTH (public — no auth required)
 # ==============================================================================
 
 @app.get("/api/health")
@@ -250,9 +285,84 @@ async def health():
         "ml_models": ml_status,
     }
 
+@app.get("/api/pipeline/status")
+async def pipeline_status():
+    """Return last-refresh timestamps and record counts for each data pipeline."""
+    import sqlite3
+    try:
+        db_path = os.path.join(os.path.dirname(__file__), "..", "data", "energylens.db")
+        if not os.path.exists(db_path):
+            db_path = "/tmp/energylens.db"
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        status = {}
+
+        # Nord Pool — Spot Prices
+        cursor.execute("SELECT COUNT(*) FROM spot_prices")
+        spot_count = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(valid_time) FROM spot_prices")
+        spot_latest_data = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(created_at) FROM spot_prices")
+        spot_last_refresh = cursor.fetchone()[0]
+        status["nordpool"] = {
+            "name": "Nord Pool — Spot prices",
+            "records": spot_count,
+            "latest_data": spot_latest_data,
+            "last_refresh": spot_last_refresh,
+        }
+
+        # Open-Meteo — Weather
+        cursor.execute("SELECT COUNT(*) FROM weather_forecasts")
+        weather_count = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(valid_time) FROM weather_forecasts")
+        weather_latest = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(created_at) FROM weather_forecasts")
+        weather_refresh = cursor.fetchone()[0]
+        status["weather"] = {
+            "name": "Open-Meteo — Weather",
+            "records": weather_count,
+            "latest_data": weather_latest,
+            "last_refresh": weather_refresh,
+        }
+
+        # ENTSO-E — Generation
+        cursor.execute("SELECT COUNT(*) FROM generation")
+        gen_count = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(valid_time) FROM generation")
+        gen_latest = cursor.fetchone()[0]
+        cursor.execute("SELECT MAX(created_at) FROM generation")
+        gen_refresh = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(DISTINCT generation_type) FROM generation")
+        gen_types = cursor.fetchone()[0]
+        status["entsoe"] = {
+            "name": "ENTSO-E — Generation",
+            "records": gen_count,
+            "latest_data": gen_latest,
+            "last_refresh": gen_refresh,
+            "generation_types": gen_types,
+        }
+
+        # Quality Gate
+        cursor.execute("SELECT COUNT(*) FROM quality_quarantine")
+        quarantine_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM forecast_log")
+        forecast_count = cursor.fetchone()[0]
+
+        status["quality_gate"] = {
+            "name": "Quality gate",
+            "forecast_log_count": forecast_count,
+            "quarantined": quarantine_count,
+        }
+
+        conn.close()
+        return {"status": "ok", "pipelines": status}
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 # ==============================================================================
-# SPOT PRICES — with stale-data fallback
+# SPOT PRICES — with stale-data fallback (public for dashboard loading)
 # ==============================================================================
 
 @app.get("/api/prices")
@@ -326,12 +436,23 @@ async def compare_zones(
 
 
 # ==============================================================================
-# FORECASTS (Phase 3)
+# FORECASTS (Phase 3) — authenticated, tracks prediction count
 # ==============================================================================
 
 @app.get("/api/forecast")
-async def forecast(zone: str = "DK1", hours: int = 24):
+async def forecast(
+    zone: str = "DK1",
+    hours: int = 24,
+    user=Depends(get_current_user),  # Optional auth — works with or without token
+):
     result = forecast_svc.forecast(zone=zone, hours=hours)
+
+    # Track prediction count for authenticated users
+    if user and "error" not in result:
+        try:
+            increment_prediction_count(user["uid"])
+        except Exception:
+            pass
 
     # Log predictions for accuracy tracking
     try:
@@ -342,7 +463,7 @@ async def forecast(zone: str = "DK1", hours: int = 24):
             confidence=result.get("confidence", 0)
         )
     except Exception as e:
-        print(f"[AccuracyLog] Warning: {e}")
+        logger.warning(f"AccuracyLog: {e}")
 
     return result
 
@@ -363,16 +484,21 @@ async def get_forecast_models():
 @app.post("/api/forecast/reload")
 async def reload_models(
     zone: Optional[str] = Query(None, description="Zone to reload, or all if omitted"),
+    user=Depends(require_admin),  # Admin only
 ):
     """Pull latest models from GCS, then reload from disk."""
     from api.gcs_sync import sync_models_from_gcs
     gcs_result = sync_models_from_gcs(local_dir="models", zone=zone)
     forecast_svc.reload_models(zone)
+    logger.info(
+        f"Models reloaded by admin {user['email']}",
+        extra={"event": "model_reload", "zone": zone or "all"},
+    )
     return {"status": "reloaded", "zone": zone or "all", "gcs_sync": gcs_result}
 
 
 # ==============================================================================
-# DATA REFRESH (called by Cloud Scheduler)
+# DATA REFRESH (called by Cloud Scheduler — no auth, uses service account)
 # ==============================================================================
 
 @app.post("/api/refresh")
@@ -408,14 +534,24 @@ async def trigger_refresh():
                 logger.warning(f"Refresh: {zone} forecast failed: {e}")
                 forecast_results[zone] = {"logged": False, "error": str(e)}
 
+        # Backup database to GCS after successful refresh
+        try:
+            from api.gcs_sync import upload_db_to_gcs
+            db_backup = upload_db_to_gcs(DB_PATH)
+            logger.info(f"DB backup: {db_backup.get('status')}")
+        except Exception as backup_err:
+            logger.warning(f"DB backup skipped: {backup_err}")
+            db_backup = {"status": "skipped"}
+
         return {
             "status": "ok",
             "sources": health,
             "forecast_logging": forecast_results,
-            "message": "Full pipeline refresh complete (spot + weather + ENTSO-E + forecast logged)"
+            "db_backup": db_backup,
+            "message": "Full pipeline refresh complete (spot + weather + ENTSO-E + forecast logged + DB backed up)"
         }
     except Exception as e:
-        logging.error(f"Pipeline refresh failed: {e}")
+        logger.error(f"Pipeline refresh failed: {e}")
         # Fallback to spot-only refresh
         result = subprocess.run(
             ["python", "auto_refresh.py"],

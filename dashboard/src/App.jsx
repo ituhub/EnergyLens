@@ -4,6 +4,11 @@ import ForecastChart from './ForecastChart';
 import AccuracyTracker from './AccuracyTracker';
 import BacktestDashboard from './BacktestDashboard';
 import ShapExplainer from './ShapExplainer';
+import LoginPage from './LoginPage';
+import PredictionLanding from './PredictionLanding';
+import AdminPanel from './AdminPanel';
+import { auth } from './firebaseConfig';
+import { onAuthStateChanged, signOut } from 'firebase/auth';
 
 // --- Design System ---
 const COLORS = {
@@ -16,9 +21,7 @@ const COLORS = {
   textMuted: "#8892a4",
   textDim: "#5a6478",
   dk1: "#22d3ee",       // Cyan — Denmark West
-  dk1Dim: "rgba(34,211,238,0.12)",
   dk2: "#a78bfa",       // Purple — Denmark East
-  dk2Dim: "rgba(167,139,250,0.12)",
   positive: "#34d399",
   warning: "#fbbf24",
   negative: "#f87171",
@@ -26,6 +29,98 @@ const COLORS = {
 };
 
 const API_BASE = (import.meta.env.VITE_API_URL || '') + '/api';
+
+// --- Auth wrapper ---
+// Manages: login → prediction landing → dashboard flow
+
+export default function App() {
+  const [firebaseUser, setFirebaseUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [idToken, setIdToken] = useState(null);
+  const [showDashboard, setShowDashboard] = useState(false);
+  const [userRole, setUserRole] = useState("user");
+
+  // Listen to Firebase auth state
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setFirebaseUser(user);
+      if (user) {
+        const token = await user.getIdToken();
+        setIdToken(token);
+
+        // Check user role from our API
+        try {
+          const res = await fetch(`${API_BASE}/auth/me`, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          if (res.ok) {
+            const data = await res.json();
+            setUserRole(data.role || "user");
+          }
+        } catch {
+          // API may be down during local dev
+        }
+      } else {
+        setIdToken(null);
+        setShowDashboard(false);
+        setUserRole("user");
+      }
+      setAuthLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const handleLogin = async (user) => {
+    setFirebaseUser(user);
+    const token = await user.getIdToken();
+    setIdToken(token);
+  };
+
+  const handleLogout = async () => {
+    await signOut(auth);
+    setFirebaseUser(null);
+    setIdToken(null);
+    setShowDashboard(false);
+    setUserRole("user");
+  };
+
+  // Auth loading state
+  if (authLoading) {
+    return (
+      <div style={{ background: COLORS.bg, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div style={{ color: COLORS.textMuted, fontSize: 14 }}>Loading...</div>
+      </div>
+    );
+  }
+
+  // Not logged in → show login page
+  if (!firebaseUser) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
+
+  // Logged in but hasn't run prediction yet → show landing
+  if (!showDashboard) {
+    return (
+      <PredictionLanding
+        user={firebaseUser}
+        token={idToken}
+        onComplete={() => setShowDashboard(true)}
+        onLogout={handleLogout}
+      />
+    );
+  }
+
+  // Logged in + prediction run → show full dashboard
+  return (
+    <EnergyLensDashboard
+      user={firebaseUser}
+      token={idToken}
+      userRole={userRole}
+      onLogout={handleLogout}
+    />
+  );
+}
+
 
 // --- Components ---
 
@@ -208,7 +303,7 @@ function CustomTooltip({ active, payload, label }) {
 
 // --- Main Dashboard ---
 
-export default function EnergyLensDashboard() {
+function EnergyLensDashboard({ user, token, userRole, onLogout }) {
   const [activeZone, setActiveZone] = useState("Both");
   const [activeTab, setActiveTab] = useState("forecast");
   const [timeRange, setTimeRange] = useState("48h");
@@ -219,14 +314,17 @@ export default function EnergyLensDashboard() {
   const [apiConnected, setApiConnected] = useState(false);
   const [dataStatus, setDataStatus] = useState("unknown"); // "fresh" | "stale" | "empty" | "offline"
   const [newestRecord, setNewestRecord] = useState(null);
+  const [pipelineStatus, setPipelineStatus] = useState(null);
+
+  const authHeaders = token ? { Authorization: `Bearer ${token}` } : {};
 
   const loadData = useCallback(async () => {
     try {
       const days = timeRange === "24h" ? 1 : timeRange === "48h" ? 2 : timeRange === "7d" ? 7 : 30;
 
       const [priceRes, healthRes] = await Promise.all([
-        fetch(`${API_BASE}/prices/compare?days=${days}`),
-        fetch(`${API_BASE}/health`),
+        fetch(`${API_BASE}/prices/compare?days=${days}`, { headers: authHeaders }),
+        fetch(`${API_BASE}/health`, { headers: authHeaders }),
       ]);
 
       const prices = await priceRes.json();
@@ -256,6 +354,7 @@ export default function EnergyLensDashboard() {
       setDk1Data(mapRecords(prices.DK1, "DK1"));
       setDk2Data(mapRecords(prices.DK2, "DK2"));
       setHealth(h.database);
+      fetch(`${API_BASE}/api/pipeline/status`).then(r => r.json()).then(d => { if (d.status === "ok") setPipelineStatus(d.pipelines); }).catch(() => {});
 
     } catch (err) {
       console.error("API unreachable:", err);
@@ -264,13 +363,13 @@ export default function EnergyLensDashboard() {
     }
 
     setLoading(false);
-  }, [timeRange]);
+  }, [timeRange, token]);
 
   useEffect(() => { loadData(); }, [loadData]);
 
   // Auto-refresh every 30s
   useEffect(() => {
-    const interval = setInterval(loadData, 30000);
+    const interval = setInterval(loadData, 300000);
     return () => clearInterval(interval);
   }, [loadData]);
 
@@ -300,6 +399,17 @@ export default function EnergyLensDashboard() {
     failed: health.quality_quarantine || 0,
     warnings: Math.floor((health.spot_prices || 0) * 0.02),
   } : { passed: 0, failed: 0, warnings: 0 };
+
+  // Build tab list — admin gets extra tab
+  const tabs = [
+    { id: 'forecast', label: '\u26A1 Forecast' },
+    { id: 'accuracy', label: '\uD83C\uDFAF Accuracy' },
+    { id: 'backtest', label: '\uD83D\uDCCA Backtest' },
+    { id: 'explain', label: '\uD83D\uDD0D Explainability' },
+  ];
+  if (userRole === "admin") {
+    tabs.push({ id: 'admin', label: '\uD83D\uDD27 Admin' });
+  }
 
   if (loading) {
     return (
@@ -333,8 +443,27 @@ export default function EnergyLensDashboard() {
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <StatusDot status={displayStatus} />
           <span style={{ fontSize: 11, color: COLORS.textDim }}>
-            {new Date().toLocaleString("da-DK", { hour: "2-digit", minute: "2-digit", second: "2-digit" })} CET
+            {user?.email}
           </span>
+          {userRole === "admin" && (
+            <span style={{
+              fontSize: 9, fontWeight: 700, color: COLORS.warning,
+              background: COLORS.warning + "18", padding: "2px 8px",
+              borderRadius: 4, letterSpacing: "0.08em", textTransform: "uppercase",
+            }}>
+              ADMIN
+            </span>
+          )}
+          <button
+            onClick={onLogout}
+            style={{
+              padding: "5px 14px", borderRadius: 6, border: `1px solid ${COLORS.border}`,
+              background: "transparent", color: COLORS.textMuted, fontSize: 12,
+              fontWeight: 600, cursor: "pointer",
+            }}
+          >
+            Sign Out
+          </button>
         </div>
       </header>
 
@@ -369,12 +498,7 @@ export default function EnergyLensDashboard() {
           borderRadius: 8,
           padding: 3,
         }}>
-          {[
-            { id: 'forecast', label: '\u26A1 Forecast' },
-            { id: 'accuracy', label: '\uD83C\uDFAF Accuracy' },
-            { id: 'backtest', label: '\uD83D\uDCCA Backtest' },
-            { id: 'explain', label: '\uD83D\uDD0D Explainability' },
-          ].map(tab => (
+          {tabs.map(tab => (
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id)}
@@ -492,25 +616,68 @@ export default function EnergyLensDashboard() {
                   background: COLORS.surface, border: `1px solid ${COLORS.border}`,
                   borderRadius: 12, overflow: "hidden",
                 }}>
-                  <ConnectorRow
-                    name="Nord Pool — Spot Prices"
-                    status={dataStatus === "fresh" ? "LIVE" : dataStatus === "stale" ? "STALE" : "OFFLINE"}
-                    records={health?.spot_prices || 0}
-                    lastUpdate={dataStatus === "fresh" ? "Updated 30s ago" : newestRecord ? `Last data: ${new Date(newestRecord).toLocaleDateString("da-DK")}` : "No data"}
-                  />
-                  <ConnectorRow
-                    name="Open-Meteo — Weather Forecasts"
-                    status={health?.weather_forecasts > 0 ? "LIVE" : "STALE"}
-                    records={health?.weather_forecasts || 0}
-                    lastUpdate="Weather features"
-                  />
-                  <ConnectorRow
-                    name="ENTSO-E — Generation Data"
-                    status={health?.generation > 0 ? "LIVE" : "STALE"}
-                    records={health?.generation || 0}
-                    lastUpdate={health?.generation > 0 ? "Generation mix" : "Set ENTSOE_API_KEY in .env"}
-                  />
-                  <div style={{ padding: "14px 16px", borderTop: `1px solid ${COLORS.border}` }}>
+                  {[
+                    {
+                      name: "Nord Pool — Spot prices",
+                      icon: "⚡",
+                      status: pipelineStatus?.nordpool ? "LIVE" : (dataStatus === "fresh" ? "LIVE" : dataStatus === "stale" ? "STALE" : "OFFLINE"),
+                      records: pipelineStatus?.nordpool?.records || health?.spot_prices || 0,
+                      lastRefresh: pipelineStatus?.nordpool?.last_refresh,
+                      latestData: pipelineStatus?.nordpool?.latest_data,
+                    },
+                    {
+                      name: "Open-Meteo — Weather",
+                      icon: "🌤",
+                      status: pipelineStatus?.weather ? "LIVE" : (health?.weather_forecasts > 0 ? "LIVE" : "STALE"),
+                      records: pipelineStatus?.weather?.records || health?.weather_forecasts || 0,
+                      lastRefresh: pipelineStatus?.weather?.last_refresh,
+                      latestData: pipelineStatus?.weather?.latest_data,
+                    },
+                    {
+                      name: "ENTSO-E — Generation",
+                      icon: "🔋",
+                      status: pipelineStatus?.entsoe ? "LIVE" : (health?.generation > 0 ? "LIVE" : "STALE"),
+                      records: pipelineStatus?.entsoe?.records || health?.generation || 0,
+                      lastRefresh: pipelineStatus?.entsoe?.last_refresh,
+                      latestData: pipelineStatus?.entsoe?.latest_data,
+                      extra: pipelineStatus?.entsoe?.generation_types ? `${pipelineStatus.entsoe.generation_types} sources` : null,
+                    },
+                  ].map((p, i) => (
+                    <div key={i} style={{ padding: "14px 16px", borderBottom: `1px solid ${COLORS.border}` }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                        <span style={{ fontSize: 13, fontWeight: 600, color: COLORS.text }}>{p.icon} {p.name}</span>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <div style={{ width: 7, height: 7, borderRadius: "50%", background: p.status === "LIVE" ? "#1D9E75" : p.status === "STALE" ? "#EF9F27" : "#E24B4A" }} />
+                          <span style={{ fontSize: 11, fontWeight: 600, color: p.status === "LIVE" ? "#1D9E75" : p.status === "STALE" ? "#EF9F27" : "#E24B4A" }}>{p.status}</span>
+                        </div>
+                      </div>
+                      <div style={{ display: "flex", gap: 24, fontSize: 12 }}>
+                        <div>
+                          <div style={{ color: COLORS.textDim, marginBottom: 2 }}>Records</div>
+                          <div style={{ fontWeight: 600, color: COLORS.text, fontVariantNumeric: "tabular-nums" }}>{p.records.toLocaleString()}</div>
+                        </div>
+                        <div>
+                          <div style={{ color: COLORS.textDim, marginBottom: 2 }}>Last refresh</div>
+                          <div style={{ fontWeight: 600, color: COLORS.text }}>
+                            {p.lastRefresh ? new Date(p.lastRefresh).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" }) + " UTC" : "—"}
+                          </div>
+                        </div>
+                        <div>
+                          <div style={{ color: COLORS.textDim, marginBottom: 2 }}>Latest data</div>
+                          <div style={{ fontWeight: 600, color: COLORS.text }}>
+                            {p.latestData ? new Date(p.latestData).toLocaleDateString("en-GB", { month: "short", day: "numeric" }) + " " + new Date(p.latestData).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" }) : "—"}
+                          </div>
+                        </div>
+                        {p.extra && (
+                          <div>
+                            <div style={{ color: COLORS.textDim, marginBottom: 2 }}>Types</div>
+                            <div style={{ fontWeight: 600, color: COLORS.text }}>{p.extra}</div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  <div style={{ padding: "14px 16px" }}>
                     <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
                       <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.text }}>Quality Gate</span>
                       <span style={{ fontSize: 11, color: COLORS.textMuted }}>
@@ -519,6 +686,8 @@ export default function EnergyLensDashboard() {
                     </div>
                     <QualityGateBar {...qualityStats} />
                   </div>
+                </div>
+
                 </div>
               </div>
 
@@ -584,9 +753,14 @@ export default function EnergyLensDashboard() {
           </div>
         )}
 
+        {/* ══════ ADMIN TAB ══════ */}
+        {activeTab === 'admin' && userRole === 'admin' && (
+          <AdminPanel token={token} />
+        )}
+
         {/* --- Footer --- */}
         <div style={{ marginTop: 40, padding: "16px 0", borderTop: `1px solid ${COLORS.border}`, display: "flex", justifyContent: "space-between" }}>
-          <span style={{ fontSize: 11, color: COLORS.textDim }}>EnergyLens v0.4.0 &mdash; ITU Consultant</span>
+          <span style={{ fontSize: 11, color: COLORS.textDim }}>EnergyLens v0.5.0 &mdash; ITU Consultant</span>
           <span style={{ fontSize: 11, color: COLORS.textDim }}>Data: Nord Pool &middot; ENTSO-E &middot; Open-Meteo</span>
         </div>
       </main>
