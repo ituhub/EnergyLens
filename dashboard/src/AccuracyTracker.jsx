@@ -262,22 +262,22 @@ export default function AccuracyTracker({ zone = 'DK1' }) {
           Forecast Accuracy
         </h3>
         <div style={{ display: 'flex', gap: '6px' }}>
-          {[24, 48, 72].map(h => (
+          {[{label:'24h', value:24}, {label:'48h', value:48}, {label:'7d', value:168}, {label:'30d', value:720}].map(({label, value}) => (
             <button
-              key={h}
-              onClick={() => setHours(h)}
+              key={value}
+              onClick={() => setHours(value)}
               style={{
                 padding: '4px 12px',
                 fontSize: '12px',
                 borderRadius: '4px',
                 border: '1px solid',
-                borderColor: hours === h ? '#3b82f6' : 'rgba(255,255,255,0.1)',
-                background: hours === h ? 'rgba(59,130,246,0.15)' : 'transparent',
-                color: hours === h ? '#60a5fa' : '#94a3b8',
+                borderColor: hours === value ? '#3b82f6' : 'rgba(255,255,255,0.1)',
+                background: hours === value ? 'rgba(59,130,246,0.15)' : 'transparent',
+                color: hours === value ? '#60a5fa' : '#94a3b8',
                 cursor: 'pointer'
               }}
             >
-              {h}h
+              {label}
             </button>
           ))}
         </div>
@@ -319,7 +319,7 @@ export default function AccuracyTracker({ zone = 'DK1' }) {
           label="Predictions"
           value={metrics.n_predictions}
           status="neutral"
-          subtitle={`Last ${hours}h`}
+          subtitle={`Last ${hours <= 48 ? hours + 'h' : Math.round(hours/24) + 'd'}`}
         />
       </div>
 
