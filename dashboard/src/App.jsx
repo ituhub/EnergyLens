@@ -687,8 +687,6 @@ function EnergyLensDashboard({ user, token, userRole, onLogout }) {
                     <QualityGateBar {...qualityStats} />
                   </div>
                 </div>
-
-                </div>
               </div>
 
               {/* Database Stats */}
