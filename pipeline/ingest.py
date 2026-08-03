@@ -109,10 +109,11 @@ class IngestionPipeline:
 
     async def _ingest_spot_prices(self) -> int:
         """Fetch and store latest spot prices."""
-        logger.info("Fetching spot prices...")
+        days = getattr(self, '_spot_days_override', 7)
+        logger.info(f"Fetching spot prices ({days} days)...")
 
         try:
-            records = await self.nordpool.get_day_ahead_prices(days_back=2)
+            records = await self.nordpool.get_day_ahead_prices(days_back=days)
         except Exception as e:
             logger.error(f"Nord Pool fetch failed: {e}")
             # Try fallback

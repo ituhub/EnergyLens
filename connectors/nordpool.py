@@ -49,11 +49,11 @@ class NordPoolProvider(BaseDataProvider):
         for record in records:
             try:
                 parsed.append({
-                    "timestamp_utc": record.get("HourUTC"),
-                    "timestamp_dk": record.get("HourDK"),
+                    "timestamp_utc": record.get("TimeUTC") or record.get("HourUTC"),
+                    "timestamp_dk": record.get("TimeDK") or record.get("HourDK"),
                     "zone": record.get("PriceArea"),
-                    "price_eur_mwh": record.get("SpotPriceEUR"),
-                    "price_dkk_mwh": record.get("SpotPriceDKK"),
+                    "price_eur_mwh": record.get("DayAheadPriceEUR") or record.get("SpotPriceEUR"),
+                    "price_dkk_mwh": record.get("DayAheadPriceDKK") or record.get("SpotPriceDKK"),
                     "source": "nordpool_via_energidataservice",
                     "fetched_at": datetime.now(timezone.utc).isoformat(),
                 })
@@ -84,13 +84,18 @@ class NordPoolProvider(BaseDataProvider):
         zones = zones or ACTIVE_ZONES
         zone_filter = ",".join(f'"{z}"' for z in zones)
 
+
+        # 15-min data × 2 zones × days_back days — need enough limit
+        row_estimate = days_back * 24 * 4 * len(zones) + 100
+        fetch_limit = min(max(row_estimate, 500), 5000)
+
         params = {
             "filter": f'{{"PriceArea":[{zone_filter}]}}',
-            "sort": "HourUTC DESC",
-            "limit": 500,
+            "sort": "TimeUTC DESC",
+            "limit": fetch_limit,
         }
 
-        return await self.fetch("dataset/Elspotprices", params=params)
+        return await self.fetch("dataset/DayAheadPrices", params=params)
 
     async def get_historical_prices(
         self,
@@ -121,14 +126,14 @@ class NordPoolProvider(BaseDataProvider):
         while True:
             params = {
                 "filter": f'{{"PriceArea":[{zone_filter}]}}',
-                "sort": "HourUTC DESC",
+                "sort": "TimeUTC DESC",
                 "limit": limit,
                 "offset": offset,
             }
 
             # Bypass cache for historical bulk loads
             batch = await self.fetch(
-                "dataset/Elspotprices",
+                "dataset/DayAheadPrices",
                 params=params,
                 use_cache=False,
             )
@@ -153,9 +158,9 @@ class NordPoolProvider(BaseDataProvider):
         """Get the most recent available price for a single zone."""
         params = {
             "filter": f'{{"PriceArea":["{zone}"]}}',
-            "sort": "HourUTC DESC",
+            "sort": "TimeUTC DESC",
             "limit": 1,
         }
 
-        records = await self.fetch("dataset/Elspotprices", params=params)
+        records = await self.fetch("dataset/DayAheadPrices", params=params)
         return records[0] if records else None

@@ -287,13 +287,13 @@ async def health():
 
 @app.get("/api/pipeline/status")
 async def pipeline_status():
-    """Return last-refresh timestamps and record counts for each data pipeline."""
+    """Return last-refresh timestamps and record counts for each data pipeline.
+    Uses knowledge_time (explicitly set on every insert) instead of created_at
+    (relies on DEFAULT which may be NULL for older rows or skipped duplicates).
+    """
     import sqlite3
     try:
-        db_path = os.path.join(os.path.dirname(__file__), "..", "data", "energylens.db")
-        if not os.path.exists(db_path):
-            db_path = "/tmp/energylens.db"
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
 
         status = {}
@@ -303,7 +303,7 @@ async def pipeline_status():
         spot_count = cursor.fetchone()[0]
         cursor.execute("SELECT MAX(valid_time) FROM spot_prices")
         spot_latest_data = cursor.fetchone()[0]
-        cursor.execute("SELECT MAX(created_at) FROM spot_prices")
+        cursor.execute("SELECT MAX(knowledge_time) FROM spot_prices")
         spot_last_refresh = cursor.fetchone()[0]
         status["nordpool"] = {
             "name": "Nord Pool — Spot prices",
@@ -317,7 +317,7 @@ async def pipeline_status():
         weather_count = cursor.fetchone()[0]
         cursor.execute("SELECT MAX(valid_time) FROM weather_forecasts")
         weather_latest = cursor.fetchone()[0]
-        cursor.execute("SELECT MAX(created_at) FROM weather_forecasts")
+        cursor.execute("SELECT MAX(knowledge_time) FROM weather_forecasts")
         weather_refresh = cursor.fetchone()[0]
         status["weather"] = {
             "name": "Open-Meteo — Weather",
@@ -331,7 +331,7 @@ async def pipeline_status():
         gen_count = cursor.fetchone()[0]
         cursor.execute("SELECT MAX(valid_time) FROM generation")
         gen_latest = cursor.fetchone()[0]
-        cursor.execute("SELECT MAX(created_at) FROM generation")
+        cursor.execute("SELECT MAX(knowledge_time) FROM generation")
         gen_refresh = cursor.fetchone()[0]
         cursor.execute("SELECT COUNT(DISTINCT generation_type) FROM generation")
         gen_types = cursor.fetchone()[0]
@@ -543,11 +543,71 @@ async def trigger_refresh():
             logger.warning(f"DB backup skipped: {backup_err}")
             db_backup = {"status": "skipped"}
 
+        # ── Staleness guard ──────────────────────────────────────────────
+        # Log ERROR for any source whose latest data is >12h old.
+        # Cloud Run ERROR logs surface in GCP console and can trigger alerts.
+        staleness_warnings = []
+        try:
+            import sqlite3
+            conn = sqlite3.connect(DB_PATH)
+            now_utc = datetime.now(timezone.utc)
+            stale_threshold = timedelta(hours=12)
+
+            checks = [
+                ("nordpool",  "SELECT MAX(valid_time) FROM spot_prices"),
+                ("weather",   "SELECT MAX(valid_time) FROM weather_forecasts"),
+                ("entsoe",    "SELECT MAX(valid_time) FROM generation"),
+            ]
+            for source_name, query in checks:
+                row = conn.execute(query).fetchone()
+                if row and row[0]:
+                    ts_str = row[0].replace("T", " ").split("+")[0]
+                    try:
+                        latest = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        age = now_utc - latest
+                        if age > stale_threshold:
+                            hours_stale = age.total_seconds() / 3600
+                            msg = f"STALE DATA: {source_name} latest data is {hours_stale:.1f}h old (threshold: 12h)"
+                            logger.error(msg)
+                            staleness_warnings.append(msg)
+                    except ValueError:
+                        pass
+            conn.close()
+        except Exception as stale_err:
+            logger.warning(f"Staleness check failed: {stale_err}")
+
+        # ── ENTSO-E gap backfill ─────────────────────────────────────────
+        # If ENTSO-E latest data is >24h old, try to backfill missed days.
+        # Handles transient 503s that leave gaps in generation data.
+        entsoe_backfill = None
+        try:
+            import sqlite3
+            conn = sqlite3.connect(DB_PATH)
+            row = conn.execute("SELECT MAX(valid_time) FROM generation").fetchone()
+            conn.close()
+            if row and row[0]:
+                ts_str = row[0].replace("T", " ").split("+")[0]
+                latest_gen = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                gap_hours = (datetime.now(timezone.utc) - latest_gen).total_seconds() / 3600
+                if gap_hours > 24:
+                    gap_days = min(int(gap_hours / 24) + 1, 7)  # cap at 7 days to stay within scheduler timeout
+                    logger.info(f"ENTSO-E gap detected: {gap_hours:.0f}h — backfilling {gap_days} days")
+                    backfill_pipeline = IngestionPipeline()
+                    backfill_pipeline.db.initialize()
+                    count = await backfill_pipeline._backfill_generation(days=gap_days)
+                    entsoe_backfill = {"days": gap_days, "records": count}
+                    logger.info(f"ENTSO-E gap backfill: {count} records over {gap_days} days")
+        except Exception as backfill_err:
+            logger.warning(f"ENTSO-E gap backfill failed: {backfill_err}")
+            entsoe_backfill = {"error": str(backfill_err)}
+
         return {
             "status": "ok",
             "sources": health,
             "forecast_logging": forecast_results,
             "db_backup": db_backup,
+            "staleness_warnings": staleness_warnings or None,
+            "entsoe_backfill": entsoe_backfill,
             "message": "Full pipeline refresh complete (spot + weather + ENTSO-E + forecast logged + DB backed up)"
         }
     except Exception as e:

@@ -143,10 +143,10 @@ class AccuracyEngine:
             hourly_prices AS (
                 SELECT
                     zone,
-                    SUBSTR(valid_time, 1, 14) || '00:00' AS hour_ts,
+                    SUBSTR(REPLACE(valid_time, 'T', ' '), 1, 14) || '00:00' AS hour_ts,
                     AVG(price_eur_mwh) AS price_eur_mwh
                 FROM spot_prices
-                GROUP BY zone, SUBSTR(valid_time, 1, 14) || '00:00'
+                GROUP BY zone, SUBSTR(REPLACE(valid_time, 'T', ' '), 1, 14) || '00:00'
             )
             SELECT
                 lf.forecast_hour,
@@ -154,7 +154,7 @@ class AccuracyEngine:
                 hp.price_eur_mwh AS actual_price
             FROM latest_forecast lf
             JOIN hourly_prices hp
-                ON lf.forecast_hour = hp.hour_ts
+                ON REPLACE(lf.forecast_hour, 'T', ' ') = hp.hour_ts
                 AND lf.zone = hp.zone
             WHERE lf.rn = 1
             ORDER BY lf.forecast_hour
@@ -301,6 +301,8 @@ class AccuracyEngine:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
         # Get all ensemble forecast/actual pairs in the window
+        # Uses hourly-averaged spot prices to handle 15-min vs hourly mismatch
+        # and normalises T/space separator differences between tables
         query = """
             WITH latest_forecast AS (
                 SELECT
@@ -312,16 +314,24 @@ class AccuracyEngine:
                 FROM forecast_log
                 WHERE zone = ? AND model_name = 'ensemble'
                   AND forecast_hour >= ?
+            ),
+            hourly_prices AS (
+                SELECT
+                    zone,
+                    SUBSTR(REPLACE(valid_time, 'T', ' '), 1, 14) || '00:00' AS hour_ts,
+                    AVG(price_eur_mwh) AS price_eur_mwh
+                FROM spot_prices
+                GROUP BY zone, SUBSTR(REPLACE(valid_time, 'T', ' '), 1, 14) || '00:00'
             )
             SELECT
                 DATE(lf.forecast_hour) AS forecast_date,
                 lf.forecast_hour,
                 lf.predicted_price,
-                sp.price_eur_mwh AS actual_price
+                hp.price_eur_mwh AS actual_price
             FROM latest_forecast lf
-            JOIN spot_prices sp
-                ON REPLACE(lf.forecast_hour, 'T', ' ') = REPLACE(sp.valid_time, 'T', ' ')
-                AND lf.zone = sp.zone
+            JOIN hourly_prices hp
+                ON REPLACE(lf.forecast_hour, 'T', ' ') = hp.hour_ts
+                AND lf.zone = hp.zone
             WHERE lf.rn = 1
             ORDER BY lf.forecast_hour
         """
@@ -432,14 +442,22 @@ class AccuracyEngine:
                     FROM forecast_log
                     WHERE zone = ? AND model_name = ?
                       AND forecast_hour >= ?
+                ),
+                hourly_prices AS (
+                    SELECT
+                        zone,
+                        SUBSTR(REPLACE(valid_time, 'T', ' '), 1, 14) || '00:00' AS hour_ts,
+                        AVG(price_eur_mwh) AS price_eur_mwh
+                    FROM spot_prices
+                    GROUP BY zone, SUBSTR(REPLACE(valid_time, 'T', ' '), 1, 14) || '00:00'
                 )
                 SELECT
                     DATE(lf.forecast_hour) AS forecast_date,
-                    AVG(ABS(lf.predicted_price - sp.price_eur_mwh)) AS daily_mae
+                    AVG(ABS(lf.predicted_price - hp.price_eur_mwh)) AS daily_mae
                 FROM latest_forecast lf
-                JOIN spot_prices sp
-                    ON REPLACE(lf.forecast_hour, 'T', ' ') = REPLACE(sp.valid_time, 'T', ' ')
-                    AND lf.zone = sp.zone
+                JOIN hourly_prices hp
+                    ON REPLACE(lf.forecast_hour, 'T', ' ') = hp.hour_ts
+                    AND lf.zone = hp.zone
                 WHERE lf.rn = 1
                 GROUP BY forecast_date
                 ORDER BY forecast_date

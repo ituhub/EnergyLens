@@ -1,10 +1,14 @@
 """
-EnergyLens — GCS Model Sync
-Downloads trained model artifacts from GCS bucket to local models/ directory.
-Kaggle trains → uploads to GCS → hit /api/forecast/reload → done.
+EnergyLens — GCS Sync (models + database).
+
+Model sync:  Kaggle trains → uploads to GCS → hit /api/forecast/reload → done.
+DB sync:     download on cold start, upload after each refresh.
+             Integrity verified with SHA-256 checksums to prevent corrupt restores.
 """
+import hashlib
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -14,17 +18,118 @@ GCS_BUCKET = os.environ.get(
     "energylens-models-project-91e8fbfb-13be-4995-831"
 )
 GCS_PREFIX = "models/"
+GCS_DB_PREFIX = "db/"
+GCS_DB_BLOB = f"{GCS_DB_PREFIX}energylens.db"
+GCS_DB_CHECKSUM_BLOB = f"{GCS_DB_PREFIX}energylens.db.sha256"
 
+
+def _get_storage_client():
+    """Lazy import + client creation."""
+    from google.cloud import storage
+    return storage.Client()
+
+
+def _sha256(filepath: str) -> str:
+    """Compute SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ==============================================================================
+# DATABASE SYNC
+# ==============================================================================
+
+def upload_db_to_gcs(db_path: str) -> dict:
+    """Upload SQLite DB to GCS with SHA-256 checksum.
+
+    Writes both the .db file and a .sha256 sidecar so that
+    download_db_from_gcs can verify integrity on restore.
+    """
+    try:
+        client = _get_storage_client()
+        bucket = client.bucket(GCS_BUCKET)
+
+        if not os.path.exists(db_path):
+            return {"status": "skipped", "reason": "db file not found"}
+
+        size_kb = os.path.getsize(db_path) / 1024
+        checksum = _sha256(db_path)
+
+        # Upload the database
+        blob = bucket.blob(GCS_DB_BLOB)
+        blob.upload_from_filename(db_path)
+
+        # Upload the checksum sidecar
+        checksum_blob = bucket.blob(GCS_DB_CHECKSUM_BLOB)
+        checksum_blob.upload_from_string(checksum)
+
+        logger.info(f"DB backup: {size_kb:.0f} KB, sha256={checksum[:16]}...")
+        return {"status": "ok", "size_kb": round(size_kb, 1), "sha256": checksum}
+
+    except Exception as e:
+        logger.error(f"DB backup failed: {e}")
+        return {"status": "error", "reason": str(e)}
+
+
+def download_db_from_gcs(db_path: str) -> dict:
+    """Download SQLite DB from GCS and verify SHA-256 checksum.
+
+    If checksum verification fails, the corrupt download is removed
+    and the app starts with a fresh database instead.
+    """
+    try:
+        client = _get_storage_client()
+        bucket = client.bucket(GCS_BUCKET)
+
+        blob = bucket.blob(GCS_DB_BLOB)
+        if not blob.exists():
+            logger.info("No DB backup in GCS — starting fresh")
+            return {"status": "fresh", "reason": "no backup found"}
+
+        # Ensure target directory exists
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        blob.download_to_filename(db_path)
+        size_kb = os.path.getsize(db_path) / 1024
+
+        # Verify checksum if sidecar exists
+        checksum_blob = bucket.blob(GCS_DB_CHECKSUM_BLOB)
+        if checksum_blob.exists():
+            expected = checksum_blob.download_as_text().strip()
+            actual = _sha256(db_path)
+            if actual != expected:
+                logger.error(
+                    f"DB CHECKSUM MISMATCH — expected {expected[:16]}... "
+                    f"got {actual[:16]}... — removing corrupt download"
+                )
+                os.remove(db_path)
+                return {"status": "error", "reason": "checksum mismatch"}
+            logger.info(f"DB restore: {size_kb:.0f} KB, checksum verified ✓")
+        else:
+            logger.info(f"DB restore: {size_kb:.0f} KB (no checksum sidecar — legacy backup)")
+
+        return {"status": "ok", "size_kb": round(size_kb, 1)}
+
+    except Exception as e:
+        logger.error(f"DB restore failed: {e}")
+        return {"status": "error", "reason": str(e)}
+
+
+# ==============================================================================
+# MODEL SYNC
+# ==============================================================================
 
 def sync_models_from_gcs(local_dir: str = "models", zone: str | None = None) -> dict:
     try:
-        from google.cloud import storage
+        client = _get_storage_client()
     except ImportError:
         logger.warning("google-cloud-storage not installed — skipping GCS sync")
         return {"status": "skipped", "reason": "google-cloud-storage not installed"}
 
     try:
-        client = storage.Client()
         bucket = client.bucket(GCS_BUCKET)
         blobs = list(bucket.list_blobs(prefix=GCS_PREFIX))
         if not blobs:
@@ -52,4 +157,83 @@ def sync_models_from_gcs(local_dir: str = "models", zone: str | None = None) -> 
 
     except Exception as e:
         logger.error(f"GCS sync failed: {e}")
+        return {"status": "error", "reason": str(e)}
+
+
+# ── Database persistence ─────────────────────────────────────
+# Sync energylens.db to/from GCS so data survives container restarts
+
+GCS_DB_KEY = "db/energylens.db"
+
+
+def download_db_from_gcs(local_path: str = "data/energylens.db") -> dict:
+    """Pull database from GCS on startup. Replaces local copy only if
+    the GCS version is newer (larger = more accumulated data)."""
+    try:
+        from google.cloud import storage
+    except ImportError:
+        logger.warning("google-cloud-storage not installed — skipping DB download")
+        return {"status": "skipped", "reason": "no gcs library"}
+
+    try:
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob = bucket.blob(GCS_DB_KEY)
+
+        if not blob.exists():
+            logger.info("No DB in GCS yet — using baked-in DB")
+            return {"status": "no_remote_db"}
+
+        remote_size = blob.size
+        local_file = Path(local_path)
+        local_size = local_file.stat().st_size if local_file.exists() else 0
+
+        # Only download if remote is larger (more data accumulated)
+        if remote_size > local_size:
+            local_file.parent.mkdir(parents=True, exist_ok=True)
+            blob.download_to_filename(str(local_file))
+            logger.info(
+                f"DB restored from GCS: {remote_size/1024:.0f} KB "
+                f"(local was {local_size/1024:.0f} KB)"
+            )
+            return {
+                "status": "restored",
+                "remote_size": remote_size,
+                "local_size_was": local_size,
+            }
+        else:
+            logger.info(
+                f"Local DB is same size or larger ({local_size/1024:.0f} KB) "
+                f"than GCS ({remote_size/1024:.0f} KB) — keeping local"
+            )
+            return {"status": "local_newer", "local": local_size, "remote": remote_size}
+
+    except Exception as e:
+        logger.error(f"DB download from GCS failed: {e}")
+        return {"status": "error", "reason": str(e)}
+
+
+def upload_db_to_gcs(local_path: str = "data/energylens.db") -> dict:
+    """Push database to GCS after data refresh. Called after every
+    successful pipeline run so accumulated data survives redeployment."""
+    try:
+        from google.cloud import storage
+    except ImportError:
+        return {"status": "skipped"}
+
+    try:
+        local_file = Path(local_path)
+        if not local_file.exists():
+            return {"status": "no_local_db"}
+
+        client = storage.Client()
+        bucket = client.bucket(GCS_BUCKET)
+        blob = bucket.blob(GCS_DB_KEY)
+        blob.upload_from_filename(str(local_file))
+        size_kb = local_file.stat().st_size / 1024
+        logger.info(f"DB backed up to GCS: {size_kb:.0f} KB")
+        return {"status": "ok", "size_kb": round(size_kb, 1)}
+
+    except Exception as e:
+        logger.error(f"DB upload to GCS failed: {e}")
         return {"status": "error", "reason": str(e)}

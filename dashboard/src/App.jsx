@@ -354,7 +354,7 @@ function EnergyLensDashboard({ user, token, userRole, onLogout }) {
       setDk1Data(mapRecords(prices.DK1, "DK1"));
       setDk2Data(mapRecords(prices.DK2, "DK2"));
       setHealth(h.database);
-      fetch(`${API_BASE}/api/pipeline/status`).then(r => r.json()).then(d => { if (d.status === "ok") setPipelineStatus(d.pipelines); }).catch(() => {});
+      fetch(`${API_BASE}/pipeline/status`, { headers: authHeaders }).then(r => r.json()).then(d => { if (d.status === "ok") setPipelineStatus(d.pipelines); }).catch(() => {});
 
     } catch (err) {
       console.error("API unreachable:", err);
