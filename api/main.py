@@ -249,6 +249,14 @@ async def _startup_refresh():
         pipeline._spot_days_override = days_back
         await pipeline.run_latest()
         logger.info(f"Cold-start refresh complete — fetched {days_back} days of spot prices")
+
+        # Backup DB to GCS so data survives if container scales down before next scheduled refresh
+        try:
+            from api.gcs_sync import upload_db_to_gcs
+            db_backup = upload_db_to_gcs(DB_PATH)
+            logger.info(f"Cold-start DB backup: {db_backup.get('status')}")
+        except Exception as backup_err:
+            logger.warning(f"Cold-start DB backup skipped: {backup_err}")
     except Exception as e:
         logger.warning(f"Cold-start refresh error: {e}")
 
