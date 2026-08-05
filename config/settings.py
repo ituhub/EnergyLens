@@ -29,7 +29,7 @@ if DB_HOST:
         "port": int(os.getenv("DB_PORT", 5432)),
         "dbname": os.getenv("DB_NAME", "energylens"),
         "user": os.getenv("DB_USER", "energylens"),
-        "password": os.getenv("DB_PASSWORD", "energylens_dev"),
+        "password": os.getenv("DB_PASSWORD", ""),
     }
     DATABASE_URL = (
         f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
